@@ -1,0 +1,8 @@
+# simulation outputs and generated streams
+sim/
+streams/
+*.yuv
+*.vcd
+*.ghw
+*.o
+*.cf
