@@ -54,4 +54,19 @@ gen cif_gop      352x288  20 "$MOV"   "keyint=5:min-keyint=5:ref=3:scenecut=0"
 gen hd720        1280x720 3  "testsrc2=size=1280x720:rate=25" "keyint=30:ref=2"
 gen hd1080       1920x1080 2 "testsrc2=size=1920x1080:rate=25" "keyint=30:ref=1"
 fi
+# synthetic streams for syntax x264 does not produce (stream_tools.py)
+ST="python3 $(dirname "$0")/stream_tools.py"
+syn() {
+    local name=$1 w=$2 h=$3 n=$4
+    $FF -i "$OUT/$name.264" -f rawvideo -pix_fmt yuv420p "$OUT/$name.ref.yuv"
+    echo "$w $h $n" > "$OUT/$name.info"
+}
+$ST pcm "$OUT/syn_pcm.264" 176 144 4 && syn syn_pcm 176 144 4
+for m in poc0 poc1 ids reorder mmco ltidr mmco,reorder ltidr,reorder,poc0,ids; do
+    n=syn_r_$(echo $m | tr , _)
+    $ST rewrite "$OUT/qcif_ref3.264" "$OUT/$n.264" "$m" && syn "$n" 176 144 10
+done
+if [ "$MODE" != quick ]; then
+    $ST rewrite "$OUT/cif_ref4.264" "$OUT/syn_c_mmco_reorder.264" mmco,reorder && syn syn_c_mmco_reorder 352 288 10
+fi
 ls "$OUT"/*.264 | wc -l

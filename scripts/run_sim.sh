@@ -49,12 +49,12 @@ for n in "${names[@]}"; do
         res=$(python3 "$HERE/yuvcmp.py" "$OUT/$n.model.yuv" "$SDIR/$n.ref.yuv" "$w" "$h")
     elif [ "$MODE" = parse ]; then
         "$MODEL" "$SDIR/$n.264" "$OUT/$n.model.yuv" -p "$OUT/$n.model_trace.txt" 2>/dev/null
-        $GHDL -r $GFLAGS tb_parse -gG_IN="$SDIR/$n.264" -gG_TRACE="$OUT/$n.rtl_trace.txt" \
+        $GHDL -r $GFLAGS tb_parse --ieee-asserts=disable-at-0 -gG_IN="$SDIR/$n.264" -gG_TRACE="$OUT/$n.rtl_trace.txt" \
             -gG_TIMEOUT_US="${TIMEOUT_US:-5000000}" > "$OUT/$n.log" 2>&1
         if cmp -s "$OUT/$n.model_trace.txt" "$OUT/$n.rtl_trace.txt"; then res="OK"; else res="TRACE MISMATCH"; fi
     else
         cw=$(( (w + 15) / 16 * 16 )); ch=$(( (h + 15) / 16 * 16 ))
-        $GHDL -r $GFLAGS tb_top -gG_IN="$SDIR/$n.264" -gG_OUT="$OUT/$n.rtl.yuv" -gG_MAXW=$cw -gG_MAXH=$ch \
+        $GHDL -r $GFLAGS tb_top --ieee-asserts=disable-at-0 -gG_IN="$SDIR/$n.264" -gG_OUT="$OUT/$n.rtl.yuv" -gG_MAXW=$cw -gG_MAXH=$ch \
             -gG_STALL="${STALL:-1}" -gG_TIMEOUT_US="${TIMEOUT_US:-5000000}" > "$OUT/$n.log" 2>&1
         res=$(python3 "$HERE/yuvcmp.py" "$OUT/$n.rtl.yuv" "$SDIR/$n.ref.yuv" "$w" "$h")
     fi

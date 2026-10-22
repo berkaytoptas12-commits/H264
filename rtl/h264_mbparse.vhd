@@ -111,11 +111,11 @@ architecture rtl of h264_mbparse is
     end function;
 
     type lb_ram_t is array (0 to C_MAX_MB_W - 1) of std_logic_vector(NBR_BITS - 1 downto 0);
-    signal lb_ram  : lb_ram_t;
+    signal lb_ram  : lb_ram_t := (others => (others => '0'));
     signal lb_we   : std_logic;
     signal lb_wa   : unsigned(6 downto 0);
     signal lb_wd   : std_logic_vector(NBR_BITS - 1 downto 0);
-    signal lb_ra   : unsigned(6 downto 0);
+    signal lb_ra   : unsigned(6 downto 0) := (others => '0');
     signal lb_rd   : std_logic_vector(NBR_BITS - 1 downto 0);
 
     -- ------------------------------------------------------------------

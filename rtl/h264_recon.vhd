@@ -212,11 +212,11 @@ architecture rtl of h264_recon is
     -- line buffer (unfiltered bottom row of the macroblock row above)
     -- ------------------------------------------------------------------
     type lb_t is array (0 to C_MAX_MB_W - 1) of std_logic_vector(255 downto 0);
-    signal lb_ram : lb_t;
+    signal lb_ram : lb_t := (others => (others => '0'));
     signal lb_we  : std_logic;
     signal lb_wa  : unsigned(6 downto 0);
     signal lb_wd  : std_logic_vector(255 downto 0);
-    signal lb_ra  : unsigned(6 downto 0);
+    signal lb_ra  : unsigned(6 downto 0) := (others => '0');
     signal lb_rd  : std_logic_vector(255 downto 0);
 
     function lb_luma(v : std_logic_vector(255 downto 0)) return pix16_t is
@@ -348,6 +348,8 @@ begin
                 rec_cnt <= (others => '0');
                 rslot <= '0';
                 tok <= MBINFO_INIT;
+                cr_addr <= (others => '0');
+                pr_addr <= (others => '0');
             else
                 case st is
                     when R_IDLE =>
@@ -403,7 +405,7 @@ begin
                         if k < 4 then
                             cr_addr <= mb.coef_slot & to_unsigned(CB_LDC, 5) & k(1 downto 0);
                         else
-                            cr_addr <= mb.coef_slot & to_unsigned(CB_CDC, 5) & (k(1 downto 0) - 4);
+                            cr_addr <= mb.coef_slot & to_unsigned(CB_CDC, 5) & k(1 downto 0);
                         end if;
                         if k >= 2 and k <= 5 then
                             for i in 0 to 3 loop

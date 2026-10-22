@@ -182,10 +182,11 @@ architecture rtl of h264_deblock is
     -- ------------------------------------------------------------------
     type lbm_t is array (0 to C_MAX_MB_W * 4 - 1) of std_logic_vector(159 downto 0);
     type lbc_t is array (0 to C_MAX_MB_W * 4 - 1) of std_logic_vector(95 downto 0);
-    signal lbm : lbm_t;
-    signal lbc : lbc_t;
+    signal lbm : lbm_t := (others => (others => '0'));
+    signal lbc : lbc_t := (others => (others => '0'));
     signal lbm_we, lbc_we : std_logic;
-    signal lbm_wa, lbc_wa, lb_ra : unsigned(8 downto 0);
+    signal lbm_wa, lbc_wa : unsigned(8 downto 0);
+    signal lb_ra  : unsigned(8 downto 0) := (others => '0');
     signal lbm_wd : std_logic_vector(159 downto 0);
     signal lbc_wd : std_logic_vector(95 downto 0);
     signal lbm_rd : std_logic_vector(159 downto 0);
@@ -305,6 +306,7 @@ begin
                 bcnt <= 0;
                 lp_v <= (others => '0');
                 cp_v <= (others => '0');
+                rr_addr <= (others => '0');
             else
                 xlast_mb := resize(mb.mb_x, 8) = mb.pic_w - 1;
                 ylast_mb := resize(mb.mb_y, 8) = mb.pic_h - 1;

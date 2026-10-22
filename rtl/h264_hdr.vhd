@@ -159,8 +159,8 @@ architecture rtl of h264_hdr is
     signal pps_wa : unsigned(7 downto 0);
     signal sps_wd : std_logic_vector(SPS_BITS - 1 downto 0);
     signal pps_wd : std_logic_vector(PPS_BITS - 1 downto 0);
-    signal sps_ra : unsigned(4 downto 0);
-    signal pps_ra : unsigned(7 downto 0);
+    signal sps_ra : unsigned(4 downto 0) := (others => '0');
+    signal pps_ra : unsigned(7 downto 0) := (others => '0');
     signal sps_rd : std_logic_vector(SPS_BITS - 1 downto 0);
     signal pps_rd : std_logic_vector(PPS_BITS - 1 downto 0);
 
@@ -213,7 +213,7 @@ architecture rtl of h264_hdr is
         S_PPS_WP, S_PPS_WB, S_PPS_QP, S_PPS_QS, S_PPS_CQP, S_PPS_DBC, S_PPS_CIP, S_PPS_RPC,
         S_PPS_T8, S_PPS_PSM, S_PPS_STORE,
         -- slice header
-        S_SL_FIRST, S_SL_TYPE, S_SL_PPS, S_SL_RDPPS, S_SL_RDSPS, S_SL_CHECK, S_SL_FN,
+        S_SL_FIRST, S_SL_TYPE, S_SL_PPS, S_SL_RDPPS, S_SL_RDSPS, S_SL_RDSPS2, S_SL_CHECK, S_SL_FN,
         S_PIC_FINISH, S_MK_MMCO, S_MK_SLIDE, S_MK_CUR, S_PIC_ALLOC,
         S_SL_IDR, S_SL_POCLSB, S_SL_DPOCB, S_SL_DPOC0, S_SL_DPOC1, S_SL_RPC,
         S_SL_NROVR, S_SL_NREF, S_RL_INIT, S_RL_SHORT, S_RL_LONG,
@@ -405,6 +405,8 @@ begin
                 oq <= (others => (others => '0'));
                 act_sps <= SPS_INIT;
                 act_pps <= PPS_INIT;
+                rl <= (others => (others => '0'));
+                rl_len <= (others => '0');
                 sl <= SLICE_INIT;
                 pic_count <= (others => '0');
                 mmco_n <= (others => '0');
@@ -870,6 +872,9 @@ begin
                     when S_SL_RDSPS =>
                         act_pps <= unpack_pps(pps_rd);
                         sps_ra <= unpack_pps(pps_rd).sps_id;
+                        st <= S_SL_RDSPS2;
+                    when S_SL_RDSPS2 =>
+                        -- RAM read latency (address register + output register)
                         st <= S_SL_CHECK;
                     when S_SL_CHECK =>
                         st <= S_SL_FN;
