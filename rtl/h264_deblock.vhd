@@ -182,8 +182,8 @@ architecture rtl of h264_deblock is
     -- ------------------------------------------------------------------
     type lbm_t is array (0 to C_MAX_MB_W * 4 - 1) of std_logic_vector(159 downto 0);
     type lbc_t is array (0 to C_MAX_MB_W * 4 - 1) of std_logic_vector(95 downto 0);
-    signal lbm : lbm_t := (others => (others => '0'));
-    signal lbc : lbc_t := (others => (others => '0'));
+    signal lbm : lbm_t;
+    signal lbc : lbc_t;
     signal lbm_we, lbc_we : std_logic;
     signal lbm_wa, lbc_wa : unsigned(8 downto 0);
     signal lb_ra  : unsigned(8 downto 0) := (others => '0');
@@ -192,7 +192,7 @@ architecture rtl of h264_deblock is
     signal lbm_rd : std_logic_vector(159 downto 0);
     signal lbc_rd : std_logic_vector(95 downto 0);
 
-    type state_t is (D_IDLE, D_LOAD, D_FILT, D_LBW, D_OUT_ROW, D_OUT_W, D_SHIFT, D_PICWAIT);
+    type state_t is (D_IDLE, D_LOAD, D_FILT, D_LBW, D_OUT, D_SHIFT, D_PICWAIT);
     signal st : state_t;
     signal st_dbg : natural;
 
@@ -220,14 +220,20 @@ architecture rtl of h264_deblock is
     signal pass    : natural range 0 to 2;    -- 0 vertical, 1 horizontal
 
     -- output
-    signal orow    : natural range 0 to 63;  -- row list index
-    signal o_plane : natural range 0 to 2;
-    signal o_r     : natural range 0 to 19;
-    signal o_beat  : natural range 0 to 3;
-    signal o_nb    : natural range 1 to 4;
-    signal o_wbase : integer;                -- frame x of first word
-    signal o_fx0   : integer;                -- frame x of array column 0
-    signal o_c0, o_c1 : natural range 0 to 19;
+    -- per plane output region (array rows o_r0..o_r1, columns o_c0..o_c1)
+    type pl_int_t is array (0 to 2) of integer range -16 to 4095;
+    type pl_nat_t is array (0 to 2) of natural range 0 to 19;
+    signal o_r0, o_c0 : natural range 0 to 4;
+    signal o_off   : integer range -4 to 4;  -- array column of byte 0 of the first word
+    signal o_r1, o_c1 : pl_nat_t;
+    signal o_nb    : pl_nat_t;               -- beats per row
+    signal o_wx    : pl_int_t;               -- frame x of the first word
+    signal o_fy0   : pl_int_t;               -- frame y of array row 0
+    -- address channel position (plane 3 = all rows issued) and data channel
+    signal aw_pl, w_pl : natural range 0 to 3;
+    signal aw_li, w_li : natural range 0 to 19;
+    signal w_beat  : natural range 0 to 3;
+    signal aw_n, w_n : natural range 0 to 63;  -- rows issued
     signal awvalid, wvalid : std_logic;
     signal awaddr  : unsigned(31 downto 0);
     signal awlen   : unsigned(7 downto 0);
@@ -286,6 +292,8 @@ begin
         variable stb    : std_logic_vector(7 downto 0);
         variable resp   : boolean;
         variable aw_hs  : boolean;
+        variable bi     : natural range 0 to 23;
+        variable pxv    : natural range 0 to 255;
         variable plane_rows : natural;
         variable xlast_mb, ylast_mb : boolean;
     begin
@@ -298,6 +306,9 @@ begin
             aw_hs := awvalid = '1' and m_awready = '1';
             if aw_hs then
                 awvalid <= '0';
+            end if;
+            if wvalid = '1' and m_wready = '1' then
+                wvalid <= '0';
             end if;
             if rst = '1' then
                 st <= D_IDLE;
@@ -377,19 +388,23 @@ begin
                         if cnt < 4 then
                             lb_ra <= resize(mb.mb_x, 7) & to_unsigned(cnt, 2);
                         end if;
-                        -- 2 cycle read latency: row cnt-2 arrives now
+                        -- 2 cycle read latency: 4x4 block cnt-2 arrives now
+                        -- (0..15 luma raster, 16..19 Cb, 20..23 Cr)
                         if cnt >= 2 and cnt <= 25 then
                             w := rr_data;
-                            if cnt <= 17 then
-                                for i in 0 to 15 loop
-                                    ay(4 + cnt - 2)(4 + i) <= to_integer(unsigned(w(i * 8 + 7 downto i * 8)));
+                            bi := cnt - 2;
+                            for r in 0 to 3 loop
+                                for c in 0 to 3 loop
+                                    pxv := to_integer(unsigned(w((r * 4 + c) * 8 + 7 downto (r * 4 + c) * 8)));
+                                    if bi < 16 then
+                                        ay(4 + (bi / 4) * 4 + r)(4 + (bi mod 4) * 4 + c) <= pxv;
+                                    elsif bi < 20 then
+                                        ac(0)(4 + ((bi - 16) / 2) * 4 + r)(4 + ((bi - 16) mod 2) * 4 + c) <= pxv;
+                                    else
+                                        ac(1)(4 + ((bi - 20) / 2) * 4 + r)(4 + ((bi - 20) mod 2) * 4 + c) <= pxv;
+                                    end if;
                                 end loop;
-                            else
-                                for i in 0 to 7 loop
-                                    ac(0)(4 + cnt - 18)(4 + i) <= to_integer(unsigned(w(i * 8 + 7 downto i * 8)));
-                                    ac(1)(4 + cnt - 18)(4 + i) <= to_integer(unsigned(w(64 + i * 8 + 7 downto 64 + i * 8)));
-                                end loop;
-                            end if;
+                            end loop;
                         end if;
                         if cnt >= 2 and cnt <= 5 then
                             for i in 0 to 11 loop
@@ -534,98 +549,103 @@ begin
                         end if;
                         cnt <= cnt + 1;
                         if cnt = 7 then
-                            orow <= 0;
-                            st <= D_OUT_ROW;
-                        end if;
-
-                    -- ------------------------------------------------
-                    -- output rows (luma rows, then Cb, then Cr)
-                    -- ------------------------------------------------
-                    when D_OUT_ROW =>
-                        -- region in array coordinates
-                        if mb.mb_y = 0 then r0 := 4; else r0 := 0; end if;
-                        if mb.mb_x = 0 then c0 := 4; else c0 := 0; end if;
-                        if orow >= 20 + 24 then
-                            li := 0;
-                            plane_rows := 0;
-                            fx0 := 0;
-                            fy := 0;
-                            r1 := 0;
-                            c1 := 0;
-                        elsif orow < 20 then
-                            o_plane <= 0;
-                            if ylast_mb then r1 := 19; else r1 := 15; end if;
-                            if xlast_mb then c1 := 19; else c1 := 15; end if;
-                            plane_rows := r1 - r0 + 1;
-                            li := r0 + orow;
-                            fx0 := to_integer(mb.mb_x) * 16 - 4;
-                            fy := to_integer(mb.mb_y) * 16 - 4 + li;
-                        else
-                            o_plane <= 1 + (orow - 20) / 12;
-                            if ylast_mb then r1 := 11; else r1 := 7; end if;
-                            if xlast_mb then c1 := 11; else c1 := 7; end if;
-                            plane_rows := r1 - r0 + 1;
-                            li := r0 + (orow - 20) mod 12;
-                            fx0 := to_integer(mb.mb_x) * 8 - 4;
-                            fy := to_integer(mb.mb_y) * 8 - 4 + li;
-                        end if;
-                        if orow >= 20 + 24 then
-                            st <= D_SHIFT;
-                        elsif (orow < 20 and orow >= plane_rows) or (orow >= 20 and (orow - 20) mod 12 >= plane_rows) then
-                            -- skip unused row slots
-                            orow <= orow + 1;
-                        elsif awvalid = '0' then
-                            fx_first := fx0 + c0;
-                            fx_last := fx0 + c1;
-                            o_r <= li;
+                            -- output region of this step
+                            if mb.mb_y = 0 then r0 := 4; else r0 := 0; end if;
+                            if mb.mb_x = 0 then c0 := 4; else c0 := 0; end if;
+                            o_r0 <= r0;
                             o_c0 <= c0;
-                            o_c1 <= c1;
-                            o_fx0 <= fx0;
-                            o_wbase <= (fx_first / 8) * 8;
-                            o_nb <= fx_last / 8 - fx_first / 8 + 1;
-                            o_beat <= 0;
-                            if orow < 20 then
-                                a := fb_plane_addr(unsigned(G_FB_BASE), mb.cur_fb, 0,
-                                                   to_unsigned((fx_first / 8) * 8, 11), to_unsigned(fy, 11));
-                            else
-                                a := fb_plane_addr(unsigned(G_FB_BASE), mb.cur_fb, 1 + (orow - 20) / 12,
-                                                   to_unsigned((fx_first / 8) * 8, 11), to_unsigned(fy, 11));
-                            end if;
-                            awaddr <= a;
-                            awlen <= to_unsigned(fx_last / 8 - fx_first / 8, 8);
-                            awvalid <= '1';
-                            st <= D_OUT_W;
+                            for pl in 0 to 2 loop
+                                if pl = 0 then
+                                    if ylast_mb then r1 := 19; else r1 := 15; end if;
+                                    if xlast_mb then c1 := 19; else c1 := 15; end if;
+                                    fx0 := to_integer(mb.mb_x) * 16 - 4;
+                                    fy := to_integer(mb.mb_y) * 16 - 4;
+                                else
+                                    if ylast_mb then r1 := 11; else r1 := 7; end if;
+                                    if xlast_mb then c1 := 11; else c1 := 7; end if;
+                                    fx0 := to_integer(mb.mb_x) * 8 - 4;
+                                    fy := to_integer(mb.mb_y) * 8 - 4;
+                                end if;
+                                fx_first := fx0 + c0;
+                                fx_last := fx0 + c1;
+                                o_r1(pl) <= r1;
+                                o_c1(pl) <= c1;
+                                o_nb(pl) <= fx_last / 8 - fx_first / 8 + 1;
+                                o_wx(pl) <= (fx_first / 8) * 8;
+                                o_fy0(pl) <= fy;
+                                if pl = 0 then
+                                    o_off <= (fx_first / 8) * 8 - fx0;
+                                end if;
+                            end loop;
+                            aw_pl <= 0;
+                            aw_li <= r0;
+                            aw_n <= 0;
+                            w_pl <= 0;
+                            w_li <= r0;
+                            w_beat <= 0;
+                            w_n <= 0;
+                            st <= D_OUT;
                         end if;
 
-                    when D_OUT_W =>
-                        if wvalid = '0' or m_wready = '1' then
-                            if wvalid = '1' and wlast = '1' then
-                                -- row finished
-                                wvalid <= '0';
-                                orow <= orow + 1;
-                                st <= D_OUT_ROW;
+                    -- ------------------------------------------------
+                    -- output rows (luma rows, then Cb, then Cr): one burst
+                    -- per row; the address channel runs ahead of the data
+                    -- channel, data beats are issued back to back.  The last
+                    -- beat / address may complete in the following states.
+                    -- ------------------------------------------------
+                    when D_OUT =>
+                        if aw_pl < 3 and (awvalid = '0' or m_awready = '1') then
+                            awaddr <= fb_plane_addr(unsigned(G_FB_BASE), mb.cur_fb, aw_pl,
+                                                    to_unsigned(o_wx(aw_pl), 11), to_unsigned(o_fy0(aw_pl) + aw_li, 11));
+                            awlen <= to_unsigned(o_nb(aw_pl) - 1, 8);
+                            awvalid <= '1';
+                            aw_n <= aw_n + 1;
+                            if aw_li = o_r1(aw_pl) then
+                                aw_pl <= aw_pl + 1;
+                                aw_li <= o_r0;
                             else
-                                -- next beat
-                                dat := (others => '0');
-                                stb := (others => '0');
-                                for i in 0 to 7 loop
-                                    x := o_wbase + o_beat * 8 + i;
-                                    c := x - o_fx0;
-                                    if c >= o_c0 and c <= o_c1 then
-                                        stb(i) := '1';
-                                        if o_plane = 0 then
-                                            dat(i * 8 + 7 downto i * 8) := std_logic_vector(to_unsigned(ay(o_r)(c), 8));
-                                        else
-                                            dat(i * 8 + 7 downto i * 8) := std_logic_vector(to_unsigned(ac(o_plane - 1)(o_r)(c), 8));
-                                        end if;
-                                    end if;
-                                end loop;
-                                wdata <= dat;
-                                wstrb <= stb;
-                                wlast <= to_sl(o_beat = o_nb - 1);
-                                wvalid <= '1';
-                                o_beat <= o_beat + 1;
+                                aw_li <= aw_li + 1;
                             end if;
+                        end if;
+                        if w_pl < 3 and w_n < aw_n and (wvalid = '0' or m_wready = '1') then
+                            -- row of the plane, then the 8 bytes of this beat
+                            ln20 := (others => 0);
+                            if w_pl = 0 then
+                                ln20 := ay(w_li);
+                            elsif w_li <= 11 then
+                                for i in 0 to 11 loop
+                                    ln20(i) := ac(w_pl - 1)(w_li)(i);
+                                end loop;
+                            end if;
+                            dat := (others => '0');
+                            stb := (others => '0');
+                            for i in 0 to 7 loop
+                                c := o_off + w_beat * 8 + i;
+                                if c >= o_c0 and c <= o_c1(w_pl) then
+                                    stb(i) := '1';
+                                    dat(i * 8 + 7 downto i * 8) := std_logic_vector(to_unsigned(ln20(c), 8));
+                                end if;
+                            end loop;
+                            wdata <= dat;
+                            wstrb <= stb;
+                            wvalid <= '1';
+                            if w_beat = o_nb(w_pl) - 1 then
+                                wlast <= '1';
+                                w_beat <= 0;
+                                w_n <= w_n + 1;
+                                if w_li = o_r1(w_pl) then
+                                    w_pl <= w_pl + 1;
+                                    w_li <= o_r0;
+                                else
+                                    w_li <= w_li + 1;
+                                end if;
+                            else
+                                wlast <= '0';
+                                w_beat <= w_beat + 1;
+                            end if;
+                        end if;
+                        if aw_pl = 3 and w_pl = 3 then
+                            st <= D_SHIFT;
                         end if;
 
                     -- ------------------------------------------------

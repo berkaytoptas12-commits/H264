@@ -24,7 +24,8 @@ entity tb_top is
         G_RLAT       : natural := 12;       -- read latency in cycles
         G_STALL      : natural := 1;        -- random AXI back-pressure
         G_TIMEOUT_US : natural := 2000000;
-        G_RTRACE     : string  := ""        -- unfiltered macroblock trace (debug)
+        G_RTRACE     : string  := "";       -- unfiltered macroblock trace (debug)
+        G_PERF       : natural := 1         -- report busy cycles per stage
     );
 end entity;
 
@@ -362,9 +363,56 @@ begin
         wait;
     end process;
 
+
+    -- busy cycles of every pipeline stage (state /= idle)
+    gen_perf : if G_PERF /= 0 generate
+        alias st_mbp is << signal .tb_top.dut.u_mbp.st_dbg : natural >>;
+        alias st_mc  is << signal .tb_top.dut.u_mc.st_dbg  : natural >>;
+        alias st_rc  is << signal .tb_top.dut.u_rec.st_dbg : natural >>;
+        alias st_db  is << signal .tb_top.dut.u_db.st_dbg  : natural >>;
+    begin
+        process (clk)
+            variable b_mbp, b_mc, b_rc, b_db : natural := 0;
+            variable reported : boolean := false;
+            type hist_t is array (0 to 63) of natural;
+            variable h_mbp, h_mc, h_rc, h_db : hist_t := (others => 0);
+            procedure hist_report(name : string; h : hist_t) is
+            begin
+                for i in 0 to 63 loop
+                    if h(i) /= 0 then
+                        report name & " state " & integer'image(i) & ": " & integer'image(h(i));
+                    end if;
+                end loop;
+            end procedure;
+        begin
+            if rising_edge(clk) then
+                -- per state cycle histograms (G_PERF > 1)
+                h_mbp(st_mbp) := h_mbp(st_mbp) + 1;
+                h_mc(st_mc) := h_mc(st_mc) + 1;
+                h_rc(st_rc) := h_rc(st_rc) + 1;
+                h_db(st_db) := h_db(st_db) + 1;
+                if stream_done = '1' and not reported and G_PERF > 1 then
+                    hist_report("mbparse", h_mbp);
+                    hist_report("mc", h_mc);
+                    hist_report("recon", h_rc);
+                    hist_report("deblock", h_db);
+                end if;
+                if st_mbp /= 0 then b_mbp := b_mbp + 1; end if;
+                if st_mc /= 0 then b_mc := b_mc + 1; end if;
+                if st_rc /= 0 then b_rc := b_rc + 1; end if;
+                if st_db /= 0 then b_db := b_db + 1; end if;
+                if stream_done = '1' and not reported then
+                    reported := true;
+                    report "busy cycles: mbparse " & integer'image(b_mbp) & " mc " & integer'image(b_mc) &
+                           " recon " & integer'image(b_rc) & " deblock " & integer'image(b_db);
+                end if;
+            end if;
+        end process;
+    end generate;
+
     -- optional trace of the reconstructed (unfiltered) macroblocks
     gen_rtrace : if G_RTRACE'length > 0 generate
-        alias rw_en   is << signal .tb_top.dut.rw_en   : std_logic_vector(15 downto 0) >>;
+        alias rw_en   is << signal .tb_top.dut.rw_en   : std_logic >>;
         alias rw_addr is << signal .tb_top.dut.rw_addr : unsigned(5 downto 0) >>;
         alias rw_data is << signal .tb_top.dut.rw_data : std_logic_vector(127 downto 0) >>;
         alias t_r     is << signal .tb_top.dut.t_r     : mbinfo_t >>;
@@ -372,6 +420,7 @@ begin
         alias db_rdy  is << signal .tb_top.dut.db_rdy  : std_logic >>;
     begin
         process (clk)
+            -- block addressed buffer: (slot*32 + block, sample)
             type buf_t is array (0 to 63, 0 to 15) of natural range 0 to 255;
             variable b : buf_t;
             file tf : text open write_mode is G_RTRACE;
@@ -379,11 +428,11 @@ begin
             variable s0 : natural;
         begin
             if rising_edge(clk) then
-                for i in 0 to 15 loop
-                    if rw_en(i) = '1' then
+                if rw_en = '1' then
+                    for i in 0 to 15 loop
                         b(to_integer(rw_addr), i) := to_integer(unsigned(rw_data(i * 8 + 7 downto i * 8)));
-                    end if;
-                end loop;
+                    end loop;
+                end if;
                 if t_r_v = '1' and db_rdy = '1' then
                     s0 := 0;
                     if t_r.rec_slot = '1' then
@@ -392,13 +441,13 @@ begin
                     write(l, "R " & integer'image(to_integer(t_r.mb_y) * to_integer(t_r.pic_w) + to_integer(t_r.mb_x)));
                     for y in 0 to 15 loop
                         for x in 0 to 15 loop
-                            write(l, " " & integer'image(b(s0 + y, x)));
+                            write(l, " " & integer'image(b(s0 + (y / 4) * 4 + x / 4, (y mod 4) * 4 + x mod 4)));
                         end loop;
                     end loop;
                     for c in 0 to 1 loop
                         for y in 0 to 7 loop
                             for x in 0 to 7 loop
-                                write(l, " " & integer'image(b(s0 + 16 + y, c * 8 + x)));
+                                write(l, " " & integer'image(b(s0 + 16 + c * 4 + (y / 4) * 2 + x / 4, (y mod 4) * 4 + x mod 4)));
                             end loop;
                         end loop;
                     end loop;

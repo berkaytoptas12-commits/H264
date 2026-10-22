@@ -48,6 +48,7 @@ architecture rtl of h264_bitreader is
     signal tail     : unsigned(3 downto 0);
     signal bitpos   : unsigned(31 downto 0);
     signal rdy      : std_logic;
+    signal room     : std_logic;    -- nbits <= 64: a byte can be appended
 begin
     o_win <= buf(71 downto 8);
     o_nbits <= nbits;
@@ -58,32 +59,18 @@ begin
     o_eos <= eos_r;
     o_bitpos <= bitpos;
 
-    -- accept a byte when it can be placed in the window this cycle
-    process (all)
-        variable n1 : integer;
-    begin
-        n1 := to_integer(nbits) - to_integer(i_consume);
-        if n1 < 0 then
-            n1 := 0;
-        end if;
-        rdy <= '0';
-        if i_flush = '0' then
-            if active = '0' then
-                -- waiting for a NAL start; drop bytes that do not start one
-                rdy <= '1';
-            elsif lastin = '0' and n1 <= 64 then
-                rdy <= '1';
-            end if;
-        end if;
-    end process;
+    -- accept a byte when it fits behind the valid bits (independent of the
+    -- amount consumed in this cycle, which keeps i_consume off this path)
+    rdy <= '1' when i_flush = '0' and (active = '0' or (lastin = '0' and room = '1')) else '0';
     o_ready <= rdy;
 
     process (clk)
-        variable n1  : integer range 0 to 72;
+        variable n1  : integer range -128 to 80;
+        variable ins : std_logic_vector(71 downto 0);
         variable b1  : std_logic_vector(71 downto 0);
         variable sh  : std_logic_vector(71 downto 0);
         variable tz  : natural range 0 to 7;
-        variable c   : integer;
+        variable c   : natural range 0 to 127;
     begin
         if rising_edge(clk) then
             if rst = '1' then
@@ -94,20 +81,31 @@ begin
                 eos_r <= '0';
                 tail <= (others => '0');
                 bitpos <= (others => '0');
+                room <= '1';
             elsif i_flush = '1' then
                 buf <= (others => '0');
                 nbits <= (others => '0');
                 active <= '0';
                 lastin <= '0';
                 bitpos <= (others => '0');
+                room <= '1';
             else
                 c := to_integer(i_consume);
-                if c > to_integer(nbits) then
-                    n1 := 0;
-                else
-                    n1 := to_integer(nbits) - c;
+                -- append the new byte behind the valid bits, then shift
+                ins := buf;
+                n1 := to_integer(nbits);
+                sh := (others => '0');
+                sh(71 downto 64) := i_data;
+                sh := std_logic_vector(shift_right(unsigned(sh), to_integer(nbits)));
+                if i_valid = '1' and rdy = '1' and active = '1' then
+                    ins := buf or sh;
+                    n1 := n1 + 8;
                 end if;
-                b1 := std_logic_vector(shift_left(unsigned(buf), c));
+                b1 := std_logic_vector(shift_left(unsigned(ins), c));
+                n1 := n1 - c;
+                if n1 < 0 then
+                    n1 := 0;
+                end if;
                 bitpos <= bitpos + c;
                 if i_valid = '1' and rdy = '1' then
                     if i_eos = '1' then
@@ -116,6 +114,7 @@ begin
                     if active = '0' then
                         if i_first = '1' then
                             active <= '1';
+                            b1 := (others => '0');
                             b1(71 downto 64) := i_data;
                             n1 := 8;
                             bitpos <= (others => '0');
@@ -123,15 +122,8 @@ begin
                                 lastin <= '1';
                             end if;
                         end if;
-                    else
-                        sh := (others => '0');
-                        sh(71 downto 64) := i_data;
-                        sh := std_logic_vector(shift_right(unsigned(sh), n1));
-                        b1 := b1 or sh;
-                        n1 := n1 + 8;
-                        if i_last = '1' then
-                            lastin <= '1';
-                        end if;
+                    elsif i_last = '1' then
+                        lastin <= '1';
                     end if;
                     if i_last = '1' then
                         tz := 0;
@@ -146,6 +138,7 @@ begin
                 end if;
                 buf <= b1;
                 nbits <= to_unsigned(n1, 7);
+                if n1 <= 64 then room <= '1'; else room <= '0'; end if;
             end if;
         end if;
     end process;

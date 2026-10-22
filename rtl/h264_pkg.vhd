@@ -213,16 +213,40 @@ package body h264_pkg is
         return t = MBT_I4x4 or t = MBT_I16 or t = MBT_IPCM;
     end function;
 
+    -- leading zero count (vectors up to 64 bits) as a binary search: log2 depth
     function clz(v : std_logic_vector) return natural is
-        variable n : natural := 0;
+        constant N : natural := v'length;
+        variable x : std_logic_vector(63 downto 0) := (others => '0');
+        variable cnt : natural range 0 to 64 := 0;
     begin
-        for i in v'range loop      -- descending range expected (MSB first)
-            if v(i) = '1' then
-                return n;
-            end if;
-            n := n + 1;
-        end loop;
-        return n;
+        x(63 downto 64 - N) := v;
+        if x(63 downto 32) = x"00000000" then
+            cnt := cnt + 32;
+            x := x(31 downto 0) & x"00000000";
+        end if;
+        if x(63 downto 48) = x"0000" then
+            cnt := cnt + 16;
+            x := x(47 downto 0) & x"0000";
+        end if;
+        if x(63 downto 56) = x"00" then
+            cnt := cnt + 8;
+            x := x(55 downto 0) & x"00";
+        end if;
+        if x(63 downto 60) = "0000" then
+            cnt := cnt + 4;
+            x := x(59 downto 0) & "0000";
+        end if;
+        if x(63 downto 62) = "00" then
+            cnt := cnt + 2;
+            x := x(61 downto 0) & "00";
+        end if;
+        if x(63) = '0' then
+            cnt := cnt + 1;
+        end if;
+        if cnt > N or unsigned(v) = 0 then
+            cnt := N;
+        end if;
+        return cnt;
     end function;
 
     function ue_decode(w : std_logic_vector) return eg_t is
@@ -230,7 +254,7 @@ package body h264_pkg is
         variable wv  : std_logic_vector(N - 1 downto 0);
         variable lz  : natural;
         variable r   : eg_t;
-        variable suf : unsigned(31 downto 0);
+        variable sh  : unsigned(N - 1 downto 0);
     begin
         wv := w;
         lz := clz(wv);
@@ -238,14 +262,9 @@ package body h264_pkg is
         r.len := (others => '0');
         r.ok := '0';
         if lz <= 31 and 2 * lz + 1 <= N then
-            suf := (others => '0');
-            for i in 0 to 31 loop
-                if i < lz then
-                    suf(i) := wv(N - 2 - 2 * lz + 1 + i);
-                end if;
-            end loop;
-            -- codeNum = 2^lz - 1 + suffix
-            r.val := shift_left(to_unsigned(1, 32), lz) - 1 + suf;
+            -- the 2*lz+1 code bits, right aligned, are codeNum + 1
+            sh := shift_right(unsigned(wv), N - 1 - 2 * lz);
+            r.val := resize(sh, 32) - 1;
             r.len := to_unsigned(2 * lz + 1, 7);
             r.ok := '1';
         end if;

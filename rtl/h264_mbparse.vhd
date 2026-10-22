@@ -9,8 +9,10 @@
 --   * neighbour context: line buffer (macroblock row above) + left registers
 --   * deblocking boundary strengths and per edge QP / filter flags
 -- Produces one mbinfo_t token per macroblock (skipped ones included).
--- The bit reader is consumed with a registered amount (one symbol every
--- second cycle) to keep the decode -> shift path short.
+-- Every bitstream element is decoded speculatively in a registered decode
+-- stage (all VLC types in parallel); the number of bits to consume in the
+-- current state is computed there as well, so the bit reader is fed by a
+-- register gated with the ready condition (one symbol every second cycle).
 -- ============================================================================
 library ieee;
 use ieee.std_logic_1164.all;
@@ -34,9 +36,9 @@ entity h264_mbparse is
         slice_done   : out std_logic;
         o_error      : out std_logic;
         -- coefficient buffer write port
-        cw_en        : out std_logic;
-        cw_addr      : out unsigned(8 downto 0);    -- slot & block & row
-        cw_data      : out std_logic_vector(63 downto 0);
+        cw_en        : out std_logic_vector(3 downto 0);   -- row lanes of a 4x4 block
+        cw_addr      : out unsigned(6 downto 0);           -- slot & block
+        cw_data      : out std_logic_vector(255 downto 0); -- row r at bits r*64+63..r*64
         i_coef_free  : in  std_logic;               -- recon released a slot
         -- macroblock token
         o_mb         : out mbinfo_t;
@@ -111,7 +113,7 @@ architecture rtl of h264_mbparse is
     end function;
 
     type lb_ram_t is array (0 to C_MAX_MB_W - 1) of std_logic_vector(NBR_BITS - 1 downto 0);
-    signal lb_ram  : lb_ram_t := (others => (others => '0'));
+    signal lb_ram  : lb_ram_t;
     signal lb_we   : std_logic;
     signal lb_wa   : unsigned(6 downto 0);
     signal lb_wd   : std_logic_vector(NBR_BITS - 1 downto 0);
@@ -128,8 +130,8 @@ architecture rtl of h264_mbparse is
     -- state
     -- ------------------------------------------------------------------
     type state_t is (ST_IDLE, ST_DIV, ST_MB_START, ST_LB_RD0, ST_LB_RD1, ST_LB_RD2,
-                     ST_SKIPRUN, ST_SKIP_MVP, ST_MBTYPE, ST_PCM_ALIGN, ST_PCM_DATA,
-                     ST_I4MODE, ST_CHROMA, ST_SUBTYPE, ST_REFIDX, ST_MVP, ST_MVDX, ST_MVDY,
+                     ST_SKIPRUN, ST_SKIP_NB, ST_SKIP_MVP, ST_MBTYPE, ST_PCM_ALIGN, ST_PCM_DATA,
+                     ST_I4MODE, ST_CHROMA, ST_SUBTYPE, ST_REFIDX, ST_MVP_NB, ST_MVP, ST_MVDX, ST_MVDY,
                      ST_CBP, ST_QPD, ST_RES_NEXT, ST_CT, ST_T1, ST_LEVEL, ST_TZ, ST_RUN,
                      ST_WRBLK, ST_BS, ST_EMIT, ST_MORE, ST_DONE);
     signal st : state_t;
@@ -182,14 +184,14 @@ architecture rtl of h264_mbparse is
     signal blk_num   : unsigned(4 downto 0);    -- coefficient buffer block
     signal blk_max   : unsigned(4 downto 0);    -- maxNumCoeff
     signal blk_start : unsigned(1 downto 0);    -- start scan index (0 / 1)
-    signal blk_nc    : integer range -1 to 16;
-    signal blk_cdc   : std_logic;
+    signal blk_nc    : integer range -1 to 16 := 0;
+    signal blk_cdc   : std_logic := '0';
     signal blk_tcpos : unsigned(4 downto 0);    -- where total_coeff is stored
-    signal tc        : unsigned(4 downto 0);
-    signal t1        : unsigned(1 downto 0);
-    signal lvl_i     : unsigned(4 downto 0);
-    signal suflen    : unsigned(2 downto 0);
-    signal zl        : unsigned(4 downto 0);
+    signal tc        : unsigned(4 downto 0) := (others => '0');
+    signal t1        : unsigned(1 downto 0) := (others => '0');
+    signal lvl_i     : unsigned(4 downto 0) := (others => '0');
+    signal suflen    : unsigned(2 downto 0) := (others => '0');
+    signal zl        : unsigned(4 downto 0) := (others => '0');
     signal pos       : signed(5 downto 0);
     signal run_i     : unsigned(4 downto 0);
     type lvl_arr_t is array (0 to 15) of signed(15 downto 0);
@@ -197,23 +199,48 @@ architecture rtl of h264_mbparse is
     signal blk       : lvl_arr_t;
     signal wr_row    : unsigned(1 downto 0);
 
+    type nb_t is record
+        ref : signed(5 downto 0);
+        mv  : mv_t;
+    end record;
+
     -- slots / output
     signal slot_cnt  : unsigned(2 downto 0);
     signal slot_wr   : unsigned(1 downto 0);
     signal tok       : mbinfo_t;
     signal tok_v     : std_logic;
 
-    signal consume   : unsigned(6 downto 0);
+    signal consume   : unsigned(6 downto 0);   -- combinational: cons_q gated with rdy_s
+    signal cons_q    : unsigned(6 downto 0);   -- bits used by the current state
+    signal cqz_q     : std_logic;              -- cons_q = 0
+    signal cz_q      : std_logic;              -- nothing consumed in the previous cycle
+    signal st_same   : std_logic;              -- st did not change in the previous cycle
+    signal rdy_s     : std_logic;
+    -- registered bitstream decode (computed from the window of the previous
+    -- cycle and the current context; valid when the state did not change and
+    -- nothing was consumed in the previous cycle)
+    type lev_t is record
+        lv   : integer range -8192 to 8191;
+        len  : natural range 0 to 31;
+        sufn : natural range 0 to 6;
+        err  : std_logic;
+    end record;
+    signal w_q       : std_logic_vector(63 downto 0);
+    signal eg_q      : eg_t;
+    signal av_q      : std_logic;
+    signal ct_q      : natural range 0 to 4095;
+    signal tz_q      : natural range 0 to 4095;
+    signal rb_q      : natural range 0 to 4095;
+    signal lev_q     : lev_t;
+    -- motion vector prediction neighbours
+    signal nbA_r, nbB_r, nbC_r : nb_t;
+    signal cref_r    : signed(5 downto 0);
     signal done_r    : std_logic;
     signal err       : std_logic;
 
     constant C_NA    : signed(5 downto 0) := to_signed(-2, 6);
     constant C_INTRA : signed(5 downto 0) := to_signed(-1, 6);
 
-    type nb_t is record
-        ref : signed(5 downto 0);
-        mv  : mv_t;
-    end record;
 
     function med3(a, b, c : signed(15 downto 0)) return signed is
         variable mn, mx : signed(15 downto 0);
@@ -236,8 +263,63 @@ architecture rtl of h264_mbparse is
         return to_unsigned(CHROMA_QP_TAB(i), 6);
     end function;
 
+    -- CAVLC level_prefix / level_suffix (9.2.2.1) on a 32 bit window
+    function level_decode(w32 : std_logic_vector(31 downto 0); sl_in : natural; first_after_t1 : boolean)
+        return lev_t is
+        variable r : lev_t;
+        variable pfx, ssz, sfx, sl_v : natural;
+        variable lc, lv : integer;
+        variable sh : unsigned(31 downto 0);
+    begin
+        r.err := '0';
+        pfx := clz(w32);
+        sl_v := sl_in;
+        if pfx > 15 then
+            r.err := '1';
+            pfx := 15;
+        end if;
+        if pfx = 14 and sl_v = 0 then
+            ssz := 4;
+        elsif pfx >= 15 then
+            ssz := 12;
+        else
+            ssz := sl_v;
+        end if;
+        -- suffix: the ssz bits after the prefix and its terminating one
+        sh := shift_left(unsigned(w32), pfx + 1);
+        if ssz > 0 then
+            sfx := to_integer(shift_right(sh, 32 - ssz));
+        else
+            sfx := 0;
+        end if;
+        lc := pfx * (2 ** sl_v) + sfx;
+        if pfx >= 15 and sl_v = 0 then
+            lc := lc + 15;
+        end if;
+        if first_after_t1 then
+            lc := lc + 2;
+        end if;
+        if lc mod 2 = 0 then
+            lv := (lc + 2) / 2;
+        else
+            lv := -((lc + 1) / 2);
+        end if;
+        r.lv := lv;
+        r.len := pfx + 1 + ssz;
+        if sl_v = 0 then
+            sl_v := 1;
+        end if;
+        if (lv > 3 * (2 ** (sl_v - 1)) or lv < -3 * (2 ** (sl_v - 1))) and sl_v < 6 then
+            sl_v := sl_v + 1;
+        end if;
+        r.sufn := sl_v;
+        return r;
+    end function;
+
 begin
     st_dbg <= state_t'pos(st);
+    rdy_s <= av_q and cz_q and st_same;
+    consume <= cons_q when rdy_s = '1' else (others => '0');
     mbp_consume <= consume;
     slice_done <= done_r;
     o_error <= err;
@@ -300,6 +382,11 @@ begin
         variable qpd     : integer;
         variable cbp_v   : unsigned(5 downto 0);
         variable ok      : boolean;
+        variable egd     : eg_t;
+        variable ctd, tzd, rbd : natural range 0 to 4095;
+        variable levd    : lev_t;
+        variable cq      : unsigned(6 downto 0);
+        variable st_v    : state_t;
 
         -- neighbour partition (x4, y4 relative to MB, in 4x4 units)
         procedure nb_get(x4, y4 : integer; variable o : out nb_t) is
@@ -381,14 +468,102 @@ begin
     begin
         if rising_edge(clk) then
             done_r <= '0';
-            cw_en <= '0';
+            cw_en <= "0000";
             lb_we <= '0';
             cons := (others => '0');
-            w := br_win;
+            -- decode stage
+            w_q <= br_win;
+            av_q <= br_avail32;
+            egd := ue_decode(br_win(63 downto 32));
+            eg_q <= egd;
+            if blk_cdc = '1' then
+                ctd := vlc_lookup(CT_ROM, CT_S, CT_LZMAX, 3, br_win(63 downto 48));
+            elsif blk_nc >= 8 then
+                ctd := CT_FLC_ROM(to_integer(unsigned(br_win(63 downto 58))));
+            elsif blk_nc >= 4 then
+                ctd := vlc_lookup(CT_ROM, CT_S, CT_LZMAX, 2, br_win(63 downto 48));
+            elsif blk_nc >= 2 then
+                ctd := vlc_lookup(CT_ROM, CT_S, CT_LZMAX, 1, br_win(63 downto 48));
+            else
+                ctd := vlc_lookup(CT_ROM, CT_S, CT_LZMAX, 0, br_win(63 downto 48));
+            end if;
+            ct_q <= ctd;
+            if tc = 0 or tc > 15 then
+                tab := 0;
+            elsif blk_cdc = '1' then
+                if tc > 3 then
+                    tab := 17;
+                else
+                    tab := 15 + to_integer(tc) - 1;
+                end if;
+            else
+                tab := to_integer(tc) - 1;
+            end if;
+            tzd := vlc_lookup(TZ_ROM, TZ_S, TZ_LZMAX, tab, br_win(63 downto 48));
+            tz_q <= tzd;
+            if zl >= 7 then
+                tab := 6;
+            elsif zl = 0 then
+                tab := 0;
+            else
+                tab := to_integer(zl) - 1;
+            end if;
+            rbd := vlc_lookup(RB_ROM, RB_S, RB_LZMAX, tab, br_win(63 downto 48));
+            rb_q <= rbd;
+            levd := level_decode(br_win(63 downto 32), to_integer(suflen), lvl_i = resize(t1, 5) and t1 < 3);
+            lev_q <= levd;
+            -- bits consumed by the element of the current state (must match
+            -- the use stage below, checked by the assertion at the end)
+            cq := (others => '0');
+            case st is
+                when ST_SKIPRUN | ST_MBTYPE | ST_CHROMA | ST_SUBTYPE |
+                     ST_MVDX | ST_MVDY | ST_CBP | ST_QPD =>
+                    cq := egd.len;
+                when ST_REFIDX =>
+                    if sl.num_ref <= 1 or ref0 = '1' then
+                        cq := (others => '0');
+                    elsif sl.num_ref = 2 then
+                        cq := to_unsigned(1, 7);
+                    else
+                        cq := egd.len;
+                    end if;
+                when ST_PCM_ALIGN =>
+                    cq := resize(to_unsigned(0, 3) - br_bitpos(2 downto 0), 7);
+                when ST_PCM_DATA =>
+                    cq := to_unsigned(32, 7);
+                when ST_I4MODE =>
+                    if br_win(63) = '1' then
+                        cq := to_unsigned(1, 7);
+                    else
+                        cq := to_unsigned(4, 7);
+                    end if;
+                when ST_CT =>
+                    cq := to_unsigned(ctd mod 32, 7);
+                when ST_T1 =>
+                    cq := resize(t1, 7);
+                when ST_LEVEL =>
+                    cq := to_unsigned(levd.len, 7);
+                when ST_TZ =>
+                    if tc /= blk_max then
+                        cq := to_unsigned(tzd mod 32, 7);
+                    end if;
+                when ST_RUN =>
+                    if run_i + 1 /= tc and zl /= 0 then
+                        cq := to_unsigned(rbd mod 32, 7);
+                    end if;
+                when others =>
+                    null;
+            end case;
+            cons_q <= cq;
+            cqz_q <= to_sl(cq = 0);
+            cz_q <= not rdy_s or cqz_q;      -- nothing consumed in this cycle
+            -- use stage
+            w := w_q;
             w32 := w(63 downto 32);
-            eg := ue_decode(w32);
+            eg := eg_q;
             se := se_from_ue(eg.val);
-            rdy := br_avail32 = '1' and consume = 0;
+            rdy := rdy_s = '1';
+            st_v := st;
 
             if tok_v = '1' and i_mb_ready = '1' then
                 tok_v <= '0';
@@ -398,12 +573,18 @@ begin
             end if;
 
             if rst = '1' then
-                st <= ST_IDLE;
+                st_v := ST_IDLE;
+                tc <= (others => '0');
+                t1 <= (others => '0');
+                zl <= (others => '0');
+                suflen <= (others => '0');
+                lvl_i <= (others => '0');
+                blk_cdc <= '0';
+                blk_nc <= 0;
                 tok_v <= '0';
                 slot_cnt <= (others => '0');
                 slot_wr <= (others => '0');
                 err <= '0';
-                consume <= (others => '0');
                 tok <= MBINFO_INIT;
             else
                 case st is
@@ -417,7 +598,7 @@ begin
                             pic_last <= resize(slice.mb_w * slice.mb_h - 1, 14);
                             reload <= '1';
                             after_skip <= '0';
-                            st <= ST_DIV;
+                            st_v := ST_DIV;
                         end if;
 
                     when ST_DIV =>
@@ -428,7 +609,7 @@ begin
                         else
                             mbx <= skip_cnt(6 downto 0);
                             skip_cnt <= (others => '0');
-                            st <= ST_MB_START;
+                            st_v := ST_MB_START;
                         end if;
 
                     when ST_MB_START =>
@@ -467,27 +648,27 @@ begin
                                 do_reload <= '0';
                             end if;
                             reload <= '0';
-                            st <= ST_LB_RD0;
+                            st_v := ST_LB_RD0;
                         end if;
 
                     when ST_LB_RD0 =>
                         -- RAM read latency: entry mbx (reload) / mbx+1 (slide)
                         lb_ra <= mbx + 1;
-                        st <= ST_LB_RD1;
+                        st_v := ST_LB_RD1;
                     when ST_LB_RD1 =>
                         if do_reload = '1' then
                             top_b <= unpack_nbr(lb_rd);
                         end if;
-                        st <= ST_LB_RD2;
+                        st_v := ST_LB_RD2;
                     when ST_LB_RD2 =>
                         top_c <= unpack_nbr(lb_rd);
                         if skip_cnt /= 0 then
                             mbtype <= MBT_PSKIP;
-                            st <= ST_SKIP_MVP;
+                            st_v := ST_SKIP_NB;
                         elsif sl.is_p = '1' and after_skip = '0' then
-                            st <= ST_SKIPRUN;
+                            st_v := ST_SKIPRUN;
                         else
-                            st <= ST_MBTYPE;
+                            st_v := ST_MBTYPE;
                         end if;
 
                     -- ------------------------------------------------
@@ -497,24 +678,33 @@ begin
                             if eg.val /= 0 then
                                 skip_cnt <= eg.val(13 downto 0);
                                 mbtype <= MBT_PSKIP;
-                                st <= ST_SKIP_MVP;
+                                st_v := ST_SKIP_NB;
                             else
-                                st <= ST_MBTYPE;
+                                st_v := ST_MBTYPE;
                             end if;
                         end if;
 
-                    when ST_SKIP_MVP =>
-                        -- P_Skip motion vector
+                    when ST_SKIP_NB =>
                         nb_get(-1, 0, nbA);
                         nb_get(0, -1, nbB);
+                        nb_get(4, -1, nbC);
+                        if nbC.ref = C_NA then
+                            nb_get(-1, -1, nbC);
+                        end if;
+                        nbA_r <= nbA;
+                        nbB_r <= nbB;
+                        nbC_r <= nbC;
+                        st_v := ST_SKIP_MVP;
+
+                    when ST_SKIP_MVP =>
+                        -- P_Skip motion vector
+                        nbA := nbA_r;
+                        nbB := nbB_r;
+                        nbC := nbC_r;
                         mvp := MV_ZERO;
                         if avA = '1' and avB = '1' and
                            not (nbA.ref = 0 and nbA.mv.x = 0 and nbA.mv.y = 0) and
                            not (nbB.ref = 0 and nbB.mv.x = 0 and nbB.mv.y = 0) then
-                            nb_get(4, -1, nbC);
-                            if nbC.ref = C_NA then
-                                nb_get(-1, -1, nbC);
-                            end if;
                             if nbB.ref = C_NA and nbC.ref = C_NA and nbA.ref /= C_NA then
                                 nbB := nbA;
                                 nbC := nbA;
@@ -540,7 +730,7 @@ begin
                             after_skip <= '1';
                         end if;
                         k <= (others => '0');
-                        st <= ST_BS;
+                        st_v := ST_BS;
 
                     -- ------------------------------------------------
                     when ST_MBTYPE =>
@@ -563,9 +753,9 @@ begin
                                 k <= (others => '0');
                                 pidx <= "00";
                                 if v >= 3 then
-                                    st <= ST_SUBTYPE;
+                                    st_v := ST_SUBTYPE;
                                 else
-                                    st <= ST_REFIDX;
+                                    st_v := ST_REFIDX;
                                 end if;
                             else
                                 if sl.is_p = '1' then
@@ -574,10 +764,10 @@ begin
                                 if v = 0 then
                                     mbtype <= MBT_I4x4;
                                     k <= (others => '0');
-                                    st <= ST_I4MODE;
+                                    st_v := ST_I4MODE;
                                 elsif v = 25 then
                                     mbtype <= MBT_IPCM;
-                                    st <= ST_PCM_ALIGN;
+                                    st_v := ST_PCM_ALIGN;
                                 elsif v < 25 then
                                     mbtype <= MBT_I16;
                                     i16_mode <= to_unsigned((v - 1) mod 4, 2);
@@ -587,10 +777,10 @@ begin
                                         cbp_v(3 downto 0) := "1111";
                                     end if;
                                     cbp <= cbp_v;
-                                    st <= ST_CHROMA;
+                                    st_v := ST_CHROMA;
                                 else
                                     err <= '1';
-                                    st <= ST_DONE;
+                                    st_v := ST_DONE;
                                 end if;
                             end if;
                         end if;
@@ -602,29 +792,34 @@ begin
                         if rdy then
                             cons := resize(to_unsigned(0, 3) - br_bitpos(2 downto 0), 7);
                             pcm_i <= (others => '0');
-                            st <= ST_PCM_DATA;
+                            st_v := ST_PCM_DATA;
                         end if;
                     when ST_PCM_DATA =>
                         if rdy then
                             cons := to_unsigned(32, 7);
                             -- 4 samples per read
-                            cw_en <= '1';
-                            cw_data <= x"00" & w32(7 downto 0) & x"00" & w32(15 downto 8) &
-                                       x"00" & w32(23 downto 16) & x"00" & w32(31 downto 24);
+                            -- one row of 4 samples, replicated on all lanes
+                            for ln in 0 to 3 loop
+                                cw_data(ln * 64 + 63 downto ln * 64) <= x"00" & w32(7 downto 0) & x"00" & w32(15 downto 8) &
+                                                                      x"00" & w32(23 downto 16) & x"00" & w32(31 downto 24);
+                            end loop;
                             v := to_integer(pcm_i);
                             if v < 64 then
                                 -- luma: row y = v/4, column group v mod 4
                                 by := v / 4;
                                 bx := v mod 4;
-                                cw_addr <= slot_wr & to_unsigned((by / 4) * 4 + bx, 5) & to_unsigned(by mod 4, 2);
+                                cw_addr <= slot_wr & to_unsigned((by / 4) * 4 + bx, 5);
+                                cw_en(by mod 4) <= '1';
                             elsif v < 80 then
                                 by := (v - 64) / 2;
                                 bx := (v - 64) mod 2;
-                                cw_addr <= slot_wr & to_unsigned(CB_CB + (by / 4) * 2 + bx, 5) & to_unsigned(by mod 4, 2);
+                                cw_addr <= slot_wr & to_unsigned(CB_CB + (by / 4) * 2 + bx, 5);
+                                cw_en(by mod 4) <= '1';
                             else
                                 by := (v - 80) / 2;
                                 bx := (v - 80) mod 2;
-                                cw_addr <= slot_wr & to_unsigned(CB_CR + (by / 4) * 2 + bx, 5) & to_unsigned(by mod 4, 2);
+                                cw_addr <= slot_wr & to_unsigned(CB_CR + (by / 4) * 2 + bx, 5);
+                                cw_en(by mod 4) <= '1';
                             end if;
                             pcm_i <= pcm_i + 1;
                             if pcm_i = 95 then
@@ -632,7 +827,7 @@ begin
                                 tcl <= (others => to_unsigned(16, 5));
                                 tcch <= (others => to_unsigned(16, 5));
                                 k <= (others => '0');
-                                st <= ST_BS;
+                                st_v := ST_BS;
                             end if;
                         end if;
 
@@ -680,7 +875,7 @@ begin
                             end if;
                             k <= k + 1;
                             if k = 15 then
-                                st <= ST_CHROMA;
+                                st_v := ST_CHROMA;
                             end if;
                         end if;
 
@@ -692,9 +887,9 @@ begin
                                 err <= '1';
                             end if;
                             if mbtype = MBT_I16 then
-                                st <= ST_QPD;
+                                st_v := ST_QPD;
                             else
-                                st <= ST_CBP;
+                                st_v := ST_CBP;
                             end if;
                         end if;
 
@@ -711,7 +906,7 @@ begin
                             k <= k + 1;
                             if k = 3 then
                                 k <= (others => '0');
-                                st <= ST_REFIDX;
+                                st_v := ST_REFIDX;
                             end if;
                         end if;
 
@@ -728,7 +923,7 @@ begin
                             refs <= (others => (others => '0'));
                             pidx <= "00";
                             sidx <= "00";
-                            st <= ST_MVP;
+                            st_v := ST_MVP_NB;
                         elsif rdy then
                             if sl.num_ref = 2 then
                                 cons := to_unsigned(1, 7);
@@ -765,19 +960,30 @@ begin
                             if to_integer(k) = pnum - 1 then
                                 pidx <= "00";
                                 sidx <= "00";
-                                st <= ST_MVP;
+                                st_v := ST_MVP_NB;
                             end if;
                         end if;
 
-                    when ST_MVP =>
+                    when ST_MVP_NB =>
                         part_geom(px4, py4, pw4, ph4, shape);
-                        cref := to_integer(refs((py4 / 2) * 2 + px4 / 2));
+                        cref_r <= signed(resize(refs((py4 / 2) * 2 + px4 / 2), 6));
                         nb_get(px4 - 1, py4, nbA);
                         nb_get(px4, py4 - 1, nbB);
                         nb_get(px4 + pw4, py4 - 1, nbC);
                         if nbC.ref = C_NA then
                             nb_get(px4 - 1, py4 - 1, nbC);
                         end if;
+                        nbA_r <= nbA;
+                        nbB_r <= nbB;
+                        nbC_r <= nbC;
+                        st_v := ST_MVP;
+
+                    when ST_MVP =>
+                        part_geom(px4, py4, pw4, ph4, shape);
+                        cref := to_integer(cref_r);
+                        nbA := nbA_r;
+                        nbB := nbB_r;
+                        nbC := nbC_r;
                         ok := false;
                         if shape = 1 then
                             if pidx = 0 and nbB.ref = cref then
@@ -811,13 +1017,13 @@ begin
                             end if;
                         end if;
                         mvp_r <= mvp;
-                        st <= ST_MVDX;
+                        st_v := ST_MVDX;
 
                     when ST_MVDX =>
                         if rdy then
                             cons := eg.len;
                             mvdx <= resize(se, 16);
-                            st <= ST_MVDY;
+                            st_v := ST_MVDY;
                         end if;
 
                     when ST_MVDY =>
@@ -835,7 +1041,7 @@ begin
                                 end loop;
                             end loop;
                             -- next partition
-                            st <= ST_MVP;
+                            st_v := ST_MVP_NB;
                             if part = 3 then
                                 if (sub(to_integer(pidx)) = 0) or
                                    (sub(to_integer(pidx)) /= 3 and sidx = 1) or
@@ -843,13 +1049,13 @@ begin
                                     sidx <= "00";
                                     pidx <= pidx + 1;
                                     if pidx = 3 then
-                                        st <= ST_CBP;
+                                        st_v := ST_CBP;
                                     end if;
                                 else
                                     sidx <= sidx + 1;
                                 end if;
                             elsif part = 0 or pidx = 1 then
-                                st <= ST_CBP;
+                                st_v := ST_CBP;
                             else
                                 pidx <= pidx + 1;
                             end if;
@@ -870,9 +1076,9 @@ begin
                             cbp <= cbp_v;
                             if cbp_v = 0 then
                                 res_phase <= to_unsigned(4, 3);
-                                st <= ST_RES_NEXT;
+                                st_v := ST_RES_NEXT;
                             else
-                                st <= ST_QPD;
+                                st_v := ST_QPD;
                             end if;
                         end if;
 
@@ -892,7 +1098,7 @@ begin
                                 res_phase <= to_unsigned(1, 3);
                             end if;
                             res_i <= (others => '0');
-                            st <= ST_RES_NEXT;
+                            st_v := ST_RES_NEXT;
                         end if;
 
                     -- ------------------------------------------------
@@ -920,7 +1126,7 @@ begin
                                 blk_tcpos <= (others => '1');
                                 res_phase <= to_unsigned(1, 3);
                                 res_i <= (others => '0');
-                                st <= ST_CT;
+                                st_v := ST_CT;
                             when 1 =>
                                 if res_i = 16 then
                                     res_phase <= to_unsigned(2, 3);
@@ -951,7 +1157,7 @@ begin
                                         blk_start <= "00";
                                     end if;
                                     res_i <= res_i + 1;
-                                    st <= ST_CT;
+                                    st_v := ST_CT;
                                 end if;
                             when 2 =>
                                 if cbp(5 downto 4) = "00" or res_i = 2 then
@@ -965,7 +1171,7 @@ begin
                                     blk_start <= "00";
                                     blk_tcpos <= (others => '1');
                                     res_i <= res_i + 1;
-                                    st <= ST_CT;
+                                    st_v := ST_CT;
                                 end if;
                             when 3 =>
                                 if cbp(5) = '0' or res_i = 8 then
@@ -990,11 +1196,11 @@ begin
                                     blk_max <= to_unsigned(15, 5);
                                     blk_start <= "01";
                                     res_i <= res_i + 1;
-                                    st <= ST_CT;
+                                    st_v := ST_CT;
                                 end if;
                             when others =>
                                 k <= (others => '0');
-                                st <= ST_BS;
+                                st_v := ST_BS;
                         end case;
                         if to_integer(res_phase) /= 2 then
                             if aA and aB then
@@ -1012,17 +1218,7 @@ begin
                     -- ------------------------------------------------
                     when ST_CT =>
                         if rdy then
-                            if blk_cdc = '1' then
-                                e := vlc_lookup(CT_ROM, CT_S, CT_LZMAX, 3, w(63 downto 48));
-                            elsif blk_nc >= 8 then
-                                e := CT_FLC_ROM(to_integer(unsigned(w(63 downto 58))));
-                            elsif blk_nc >= 4 then
-                                e := vlc_lookup(CT_ROM, CT_S, CT_LZMAX, 2, w(63 downto 48));
-                            elsif blk_nc >= 2 then
-                                e := vlc_lookup(CT_ROM, CT_S, CT_LZMAX, 1, w(63 downto 48));
-                            else
-                                e := vlc_lookup(CT_ROM, CT_S, CT_LZMAX, 0, w(63 downto 48));
-                            end if;
+                            e := ct_q;
                             cons := to_unsigned(e mod 32, 7);
                             v := e / 32;
                             tc <= to_unsigned(v / 4, 5);
@@ -1034,7 +1230,7 @@ begin
                             lvl_i <= (others => '0');
                             if e mod 32 = 0 or v / 4 > to_integer(blk_max) then
                                 err <= '1';
-                                st <= ST_DONE;
+                                st_v := ST_DONE;
                             elsif v / 4 = 0 then
                                 -- empty block
                                 if blk_tcpos(4) = '0' then
@@ -1044,14 +1240,14 @@ begin
                                 end if;
                                 if blk_cdc = '1' then
                                     wr_row <= "00";
-                                    st <= ST_WRBLK;
+                                    st_v := ST_WRBLK;
                                 else
-                                    st <= ST_RES_NEXT;
+                                    st_v := ST_RES_NEXT;
                                 end if;
                             elsif v mod 4 = 0 then
-                                st <= ST_LEVEL;
+                                st_v := ST_LEVEL;
                             else
-                                st <= ST_T1;
+                                st_v := ST_T1;
                             end if;
                             -- store total_coeff for nC
                             if blk_tcpos(4) = '0' then
@@ -1075,64 +1271,23 @@ begin
                             end loop;
                             lvl_i <= resize(t1, 5);
                             if t1 = tc then
-                                st <= ST_TZ;
+                                st_v := ST_TZ;
                             else
-                                st <= ST_LEVEL;
+                                st_v := ST_LEVEL;
                             end if;
                         end if;
 
                     when ST_LEVEL =>
                         if rdy then
-                            pfx := clz(w32);
-                            sl_v := to_integer(suflen);
-                            if pfx = 14 and sl_v = 0 then
-                                ssz := 4;
-                            elsif pfx >= 15 then
-                                ssz := pfx - 3;
-                            else
-                                ssz := sl_v;
-                            end if;
-                            sfx := 0;
-                            for i in 0 to 15 loop
-                                if i < ssz and 30 - pfx - i >= 0 then
-                                    sfx := sfx * 2;
-                                    if w32(30 - pfx - i) = '1' then
-                                        sfx := sfx + 1;
-                                    end if;
-                                end if;
-                            end loop;
-                            if pfx > 15 then
+                            cons := to_unsigned(lev_q.len, 7);
+                            if lev_q.err = '1' then
                                 err <= '1';
-                                pfx := 15;
                             end if;
-                            lc := pfx * (2 ** sl_v);
-                            if pfx = 15 and sl_v > 0 then
-                                lc := 15 * (2 ** sl_v);
-                            end if;
-                            lc := lc + sfx;
-                            if pfx >= 15 and sl_v = 0 then
-                                lc := lc + 15;
-                            end if;
-                            if lvl_i = resize(t1, 5) and t1 < 3 then
-                                lc := lc + 2;
-                            end if;
-                            if lc mod 2 = 0 then
-                                lv := (lc + 2) / 2;
-                            else
-                                lv := -((lc + 1) / 2);
-                            end if;
-                            cons := to_unsigned(pfx + 1 + ssz, 7);
-                            lvl(to_integer(lvl_i(3 downto 0))) <= to_signed(lv, 16);
-                            if sl_v = 0 then
-                                sl_v := 1;
-                            end if;
-                            if (lv > 3 * (2 ** (sl_v - 1)) or lv < -3 * (2 ** (sl_v - 1))) and sl_v < 6 then
-                                sl_v := sl_v + 1;
-                            end if;
-                            suflen <= to_unsigned(sl_v, 3);
+                            lvl(to_integer(lvl_i(3 downto 0))) <= to_signed(lev_q.lv, 16);
+                            suflen <= to_unsigned(lev_q.sufn, 3);
                             lvl_i <= lvl_i + 1;
                             if lvl_i + 1 = tc then
-                                st <= ST_TZ;
+                                st_v := ST_TZ;
                             end if;
                         end if;
 
@@ -1141,14 +1296,9 @@ begin
                             zl <= (others => '0');
                             pos <= signed(resize(tc, 6)) - 1;
                             run_i <= (others => '0');
-                            st <= ST_RUN;
+                            st_v := ST_RUN;
                         elsif rdy then
-                            if blk_cdc = '1' then
-                                tab := 15 + to_integer(tc) - 1;
-                            else
-                                tab := to_integer(tc) - 1;
-                            end if;
-                            e := vlc_lookup(TZ_ROM, TZ_S, TZ_LZMAX, tab, w(63 downto 48));
+                            e := tz_q;
                             cons := to_unsigned(e mod 32, 7);
                             if e mod 32 = 0 then
                                 err <= '1';
@@ -1156,7 +1306,7 @@ begin
                             zl <= to_unsigned(e / 32, 5);
                             pos <= signed(resize(tc, 6)) + to_signed(e / 32, 6) - 1;
                             run_i <= (others => '0');
-                            st <= ST_RUN;
+                            st_v := ST_RUN;
                         end if;
 
                     when ST_RUN =>
@@ -1175,19 +1325,14 @@ begin
                             -- last coefficient
                             blk(r) <= lvl(to_integer(run_i(3 downto 0)));
                             wr_row <= "00";
-                            st <= ST_WRBLK;
+                            st_v := ST_WRBLK;
                         elsif zl = 0 then
                             blk(r) <= lvl(to_integer(run_i(3 downto 0)));
                             pos <= pos - 1;
                             run_i <= run_i + 1;
                         elsif rdy then
                             blk(r) <= lvl(to_integer(run_i(3 downto 0)));
-                            if zl >= 7 then
-                                tab := 6;
-                            else
-                                tab := to_integer(zl) - 1;
-                            end if;
-                            e := vlc_lookup(RB_ROM, RB_S, RB_LZMAX, tab, w(63 downto 48));
+                            e := rb_q;
                             cons := to_unsigned(e mod 32, 7);
                             if e mod 32 = 0 or e / 32 > to_integer(zl) then
                                 err <= '1';
@@ -1199,25 +1344,26 @@ begin
                         end if;
 
                     when ST_WRBLK =>
-                        cw_en <= '1';
+                        cw_addr <= slot_wr & blk_num;
                         if blk_cdc = '1' then
                             -- chroma DC: Cb in row 0, Cr in row 1
-                            cw_addr <= slot_wr & blk_num & (res_i(1 downto 0) - 1);
-                            cw_data <= std_logic_vector(blk(3)) & std_logic_vector(blk(2)) &
-                                       std_logic_vector(blk(1)) & std_logic_vector(blk(0));
+                            for ln in 0 to 1 loop
+                                cw_data(ln * 64 + 63 downto ln * 64) <= std_logic_vector(blk(3)) & std_logic_vector(blk(2)) &
+                                                                      std_logic_vector(blk(1)) & std_logic_vector(blk(0));
+                            end loop;
+                            cw_en(to_integer(res_i(1 downto 0)) - 1) <= '1';
                             nz(17) <= '1';
-                            st <= ST_RES_NEXT;
                         else
-                            r := to_integer(wr_row);
-                            cw_addr <= slot_wr & blk_num & wr_row;
-                            cw_data <= std_logic_vector(blk(r * 4 + 3)) & std_logic_vector(blk(r * 4 + 2)) &
-                                       std_logic_vector(blk(r * 4 + 1)) & std_logic_vector(blk(r * 4));
+                            -- whole block in one write
+                            for ln in 0 to 3 loop
+                                cw_data(ln * 64 + 63 downto ln * 64) <= std_logic_vector(blk(ln * 4 + 3)) &
+                                    std_logic_vector(blk(ln * 4 + 2)) & std_logic_vector(blk(ln * 4 + 1)) &
+                                    std_logic_vector(blk(ln * 4));
+                            end loop;
+                            cw_en <= "1111";
                             nz(to_integer(blk_num)) <= '1';
-                            wr_row <= wr_row + 1;
-                            if wr_row = 3 then
-                                st <= ST_RES_NEXT;
-                            end if;
                         end if;
+                        st_v := ST_RES_NEXT;
 
                     -- ------------------------------------------------
                     -- boundary strengths
@@ -1231,7 +1377,7 @@ begin
                                     bs(i) <= to_unsigned(3, 3);
                                 end if;
                             end loop;
-                            st <= ST_EMIT;
+                            st_v := ST_EMIT;
                         else
                             dir := to_integer(k(4 downto 4));
                             ed := to_integer(k(3 downto 2));
@@ -1273,7 +1419,7 @@ begin
                             bs(to_integer(k)) <= to_unsigned(bsv, 3);
                             k <= k + 1;
                             if k = 31 then
-                                st <= ST_EMIT;
+                                st_v := ST_EMIT;
                             end if;
                         end if;
 
@@ -1376,31 +1522,37 @@ begin
                             else
                                 mbx <= mbx + 1;
                             end if;
-                            st <= ST_MORE;
+                            st_v := ST_MORE;
                         end if;
 
                     when ST_MORE =>
                         if addr > pic_last then
                             -- end of picture
-                            st <= ST_DONE;
+                            st_v := ST_DONE;
                         elsif skip_cnt /= 0 then
-                            st <= ST_MB_START;
+                            st_v := ST_MB_START;
                         elsif rdy then
                             if br_more = '1' then
-                                st <= ST_MB_START;
+                                st_v := ST_MB_START;
                             else
-                                st <= ST_DONE;
+                                st_v := ST_DONE;
                             end if;
                         end if;
 
                     when ST_DONE =>
-                        if consume = 0 then
-                            done_r <= '1';
-                            st <= ST_IDLE;
-                        end if;
+                        done_r <= '1';
+                        st_v := ST_IDLE;
                 end case;
-                consume <= cons;
+                -- synthesis translate_off
+                assert cons = consume
+                    report "mbparse: precomputed consume mismatch in " & state_t'image(st) &
+                           " cons=" & integer'image(to_integer(cons)) &
+                           " pre=" & integer'image(to_integer(consume))
+                    severity failure;
+                -- synthesis translate_on
             end if;
+            st <= st_v;
+            st_same <= to_sl(st_v = st);
         end if;
     end process;
 

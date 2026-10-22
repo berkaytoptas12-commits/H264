@@ -164,6 +164,7 @@ architecture rtl of h264_mc is
     -- ------------------------------------------------------------------
     type cst_t is (C_IDLE, C_BARRIER, C_PLIST, C_RUN, C_EMIT);
     signal cst : cst_t;
+    signal st_dbg : natural;   -- simulation aid
     signal mb       : mbinfo_t;
     signal pl       : plist_t;
     signal nparts   : natural range 0 to 16;
@@ -205,6 +206,7 @@ architecture rtl of h264_mc is
     signal jobs_done : natural range 0 to 48;
     signal row_consumed : std_logic;
 begin
+    st_dbg <= cst_t'pos(cst);
     o_mb <= tok;
     o_mb_valid <= tok_v;
     o_mb_ready <= '1' when cst = C_IDLE and pred_cnt < 2 else '0';

@@ -152,8 +152,8 @@ architecture rtl of h264_hdr is
 
     type sps_ram_t is array (0 to 31) of std_logic_vector(SPS_BITS - 1 downto 0);
     type pps_ram_t is array (0 to 255) of std_logic_vector(PPS_BITS - 1 downto 0);
-    signal sps_ram : sps_ram_t := (others => (others => '0'));
-    signal pps_ram : pps_ram_t := (others => (others => '0'));
+    signal sps_ram : sps_ram_t;
+    signal pps_ram : pps_ram_t;
     signal sps_we, pps_we : std_logic;
     signal sps_wa : unsigned(4 downto 0);
     signal pps_wa : unsigned(7 downto 0);
@@ -214,10 +214,10 @@ architecture rtl of h264_hdr is
         S_PPS_T8, S_PPS_PSM, S_PPS_STORE,
         -- slice header
         S_SL_FIRST, S_SL_TYPE, S_SL_PPS, S_SL_RDPPS, S_SL_RDSPS, S_SL_RDSPS2, S_SL_CHECK, S_SL_FN,
-        S_PIC_FINISH, S_MK_MMCO, S_MK_SLIDE, S_MK_CUR, S_PIC_ALLOC,
+        S_PIC_FINISH, S_MK_MMCO, S_MK_OPSCAN, S_MK_SLIDE, S_MK_CUR, S_PIC_ALLOC,
         S_SL_IDR, S_SL_POCLSB, S_SL_DPOCB, S_SL_DPOC0, S_SL_DPOC1, S_SL_RPC,
         S_SL_NROVR, S_SL_NREF, S_RL_INIT, S_RL_SHORT, S_RL_LONG,
-        S_SL_RPLM, S_SL_MODIDC, S_SL_MODVAL, S_RL_MODSHIFT, S_RL_COMPACT,
+        S_SL_RPLM, S_SL_MODIDC, S_SL_MODVAL, S_RL_MODFIND, S_RL_MODSHIFT, S_RL_COMPACT,
         S_SL_NOOUT, S_SL_LTREF, S_SL_ADAPT, S_SL_MMCO, S_SL_MMCO_A, S_SL_MMCO_B,
         S_SL_QPD, S_SL_DDF, S_SL_ALPHA, S_SL_BETA, S_SL_START, S_SL_WAIT,
         S_EOS_FINISH, S_DONE);
@@ -265,8 +265,19 @@ architecture rtl of h264_hdr is
     signal mmco_n   : unsigned(4 downto 0);
     signal mmco_k   : unsigned(4 downto 0);
     signal mmco_cur : unsigned(2 downto 0);
+    -- sequential scans over the frame buffers (one entry per cycle)
+    signal si       : natural range 0 to C_NUM_FB;
+    signal best_i   : integer range -1 to C_NUM_FB - 1;
+    signal best_v   : signed(17 downto 0);
+    signal cnt_ref  : natural range 0 to C_NUM_FB;
+    signal pnum_r   : signed(17 downto 0);
 
     signal consume  : unsigned(6 downto 0);
+    signal cons_d1  : unsigned(6 downto 0);  -- consume of the previous cycle
+    -- registered window decode (header syntax is not time critical: 3 cycles per element)
+    signal w_q      : std_logic_vector(63 downto 0);
+    signal eg_q     : eg_t;
+    signal av_q     : std_logic;
     signal flush    : std_logic;
     signal own      : std_logic;
     signal sstart   : std_logic;
@@ -328,7 +339,8 @@ begin
         variable rdy    : boolean;
         variable cons   : unsigned(6 downto 0);
         variable w      : std_logic_vector(63 downto 0);
-        variable pn     : pn_arr_t;
+        variable pn_si  : signed(17 downto 0);
+        variable op     : natural range 0 to 7;
         variable best   : integer;
         variable n      : integer;
         variable cntref : integer;
@@ -358,17 +370,18 @@ begin
             flush <= '0';
             sstart <= '0';
             cons := (others => '0');
-            w := br_win;
-            eg := ue_decode(w);
+            w_q <= br_win;
+            eg_q <= ue_decode(br_win);
+            av_q <= br_avail64;
+            cons_d1 <= consume;
+            w := w_q;
+            eg := eg_q;
             ue := eg.val;
             se := se_from_ue(eg.val);
-            -- consume is registered: the window moves one cycle after a read,
-            -- so a read is only allowed while no consume is in flight
-            rdy := br_avail64 = '1' and own = '1' and flush = '0' and consume = 0;
+            -- consume is registered and the window decode is registered: a read
+            -- is allowed when no consume was issued in the last two cycles
+            rdy := av_q = '1' and own = '1' and flush = '0' and consume = 0 and cons_d1 = 0;
             maxfn := shift_left(to_signed(1, 18), to_integer(act_sps.log2fn));
-            for i in 0 to C_NUM_FB - 1 loop
-                pn(i) := pic_num(dpb_fn(i), sl_fn, act_sps.log2fn);
-            end loop;
             oq_v := oq;
             oqc_v := oq_cnt;
 
@@ -935,96 +948,104 @@ begin
                         elsif pic_adapt = '1' then
                             st <= S_MK_MMCO;
                         else
+                            si <= 0;
+                            cnt_ref <= 0;
+                            best_i <= -1;
                             st <= S_MK_SLIDE;
                         end if;
 
                     when S_MK_MMCO =>
+                        -- one operation per pass; the frame buffers are scanned one per cycle
                         if mmco_k = mmco_n then
                             st <= S_MK_CUR;
                         else
-                            mmco_k <= mmco_k + 1;
-                            for i in 0 to C_NUM_FB - 1 loop
-                                pn(i) := pic_num(dpb_fn(i), pic_fn, act_sps.log2fn);
-                            end loop;
-                            pnum := signed(resize(pic_fn, 18)) - signed(resize(mmco_a(to_integer(mmco_k)), 18));
-                            case to_integer(mmco_op(to_integer(mmco_k))) is
+                            op := to_integer(mmco_op(to_integer(mmco_k)));
+                            pnum_r <= signed(resize(pic_fn, 18)) - signed(resize(mmco_a(to_integer(mmco_k)), 18));
+                            si <= 0;
+                            if op = 4 then
+                                max_lt <= signed(resize(mmco_a(to_integer(mmco_k)), 6)) - 1;
+                            end if;
+                            if op = 5 then
+                                for i in 0 to C_NUM_FB - 1 loop
+                                    if i /= to_integer(cur_fb) then
+                                        dpb_ref(i) <= REF_NONE;
+                                    end if;
+                                end loop;
+                                max_lt <= to_signed(-1, 6);
+                                pic_mmco5 <= '1';
+                                mmco_k <= mmco_k + 1;
+                            else
+                                st <= S_MK_OPSCAN;
+                            end if;
+                        end if;
+
+                    when S_MK_OPSCAN =>
+                        op := to_integer(mmco_op(to_integer(mmco_k)));
+                        pn_si := pic_num(dpb_fn(si), pic_fn, act_sps.log2fn);
+                        if si /= to_integer(cur_fb) then
+                            case op is
                                 when 1 =>
-                                    for i in 0 to C_NUM_FB - 1 loop
-                                        if i /= to_integer(cur_fb) and dpb_ref(i) = REF_SHORT and pn(i) = pnum then
-                                            dpb_ref(i) <= REF_NONE;
-                                        end if;
-                                    end loop;
+                                    if dpb_ref(si) = REF_SHORT and pn_si = pnum_r then
+                                        dpb_ref(si) <= REF_NONE;
+                                    end if;
                                 when 2 =>
-                                    for i in 0 to C_NUM_FB - 1 loop
-                                        if i /= to_integer(cur_fb) and dpb_ref(i) = REF_LONG and
-                                           resize(dpb_lt(i), 17) = mmco_a(to_integer(mmco_k)) then
-                                            dpb_ref(i) <= REF_NONE;
-                                        end if;
-                                    end loop;
+                                    if dpb_ref(si) = REF_LONG and resize(dpb_lt(si), 17) = mmco_a(to_integer(mmco_k)) then
+                                        dpb_ref(si) <= REF_NONE;
+                                    end if;
                                 when 3 =>
-                                    for i in 0 to C_NUM_FB - 1 loop
-                                        if i /= to_integer(cur_fb) and dpb_ref(i) = REF_LONG and
-                                           dpb_lt(i) = mmco_b(to_integer(mmco_k)) then
-                                            dpb_ref(i) <= REF_NONE;
-                                        end if;
-                                        if i /= to_integer(cur_fb) and dpb_ref(i) = REF_SHORT and pn(i) = pnum then
-                                            dpb_ref(i) <= REF_LONG;
-                                            dpb_lt(i) <= mmco_b(to_integer(mmco_k));
-                                        end if;
-                                    end loop;
+                                    if dpb_ref(si) = REF_LONG and dpb_lt(si) = mmco_b(to_integer(mmco_k)) then
+                                        dpb_ref(si) <= REF_NONE;
+                                    end if;
+                                    if dpb_ref(si) = REF_SHORT and pn_si = pnum_r then
+                                        dpb_ref(si) <= REF_LONG;
+                                        dpb_lt(si) <= mmco_b(to_integer(mmco_k));
+                                    end if;
                                 when 4 =>
-                                    for i in 0 to C_NUM_FB - 1 loop
-                                        if i /= to_integer(cur_fb) and dpb_ref(i) = REF_LONG and
-                                           resize(dpb_lt(i), 17) >= mmco_a(to_integer(mmco_k)) then
-                                            dpb_ref(i) <= REF_NONE;
-                                        end if;
-                                    end loop;
-                                    max_lt <= signed(resize(mmco_a(to_integer(mmco_k)), 6)) - 1;
-                                when 5 =>
-                                    for i in 0 to C_NUM_FB - 1 loop
-                                        if i /= to_integer(cur_fb) then
-                                            dpb_ref(i) <= REF_NONE;
-                                        end if;
-                                    end loop;
-                                    max_lt <= to_signed(-1, 6);
-                                    pic_mmco5 <= '1';
+                                    if dpb_ref(si) = REF_LONG and resize(dpb_lt(si), 17) >= mmco_a(to_integer(mmco_k)) then
+                                        dpb_ref(si) <= REF_NONE;
+                                    end if;
                                 when 6 =>
-                                    for i in 0 to C_NUM_FB - 1 loop
-                                        if i /= to_integer(cur_fb) and dpb_ref(i) = REF_LONG and
-                                           dpb_lt(i) = mmco_b(to_integer(mmco_k)) then
-                                            dpb_ref(i) <= REF_NONE;
-                                        end if;
-                                    end loop;
-                                    dpb_ref(to_integer(cur_fb)) <= REF_LONG;
-                                    dpb_lt(to_integer(cur_fb)) <= mmco_b(to_integer(mmco_k));
-                                    pic_cur_long <= '1';
+                                    if dpb_ref(si) = REF_LONG and dpb_lt(si) = mmco_b(to_integer(mmco_k)) then
+                                        dpb_ref(si) <= REF_NONE;
+                                    end if;
                                 when others =>
                                     null;
                             end case;
                         end if;
+                        if si = C_NUM_FB - 1 then
+                            if op = 6 then
+                                dpb_ref(to_integer(cur_fb)) <= REF_LONG;
+                                dpb_lt(to_integer(cur_fb)) <= mmco_b(to_integer(mmco_k));
+                                pic_cur_long <= '1';
+                            end if;
+                            mmco_k <= mmco_k + 1;
+                            st <= S_MK_MMCO;
+                        else
+                            si <= si + 1;
+                        end if;
 
                     when S_MK_SLIDE =>
-                        cntref := 0;
-                        best := -1;
-                        for i in 0 to C_NUM_FB - 1 loop
-                            pn(i) := pic_num(dpb_fn(i), pic_fn, act_sps.log2fn);
-                            if i /= to_integer(cur_fb) and dpb_ref(i) /= REF_NONE then
-                                cntref := cntref + 1;
-                            end if;
-                        end loop;
-                        for i in 0 to C_NUM_FB - 1 loop
-                            if i /= to_integer(cur_fb) and dpb_ref(i) = REF_SHORT then
-                                if best < 0 then
-                                    best := i;
-                                elsif pn(i) < pn(best) then
-                                    best := i;
-                                end if;
-                            end if;
-                        end loop;
-                        if cntref >= maximum(to_integer(act_sps.nrf), 1) and best >= 0 then
-                            dpb_ref(best) <= REF_NONE;
+                        -- count references, find the short-term one with the smallest FrameNumWrap
+                        pn_si := pic_num(dpb_fn(si), pic_fn, act_sps.log2fn);
+                        cntref := cnt_ref;
+                        best := best_i;
+                        if si /= to_integer(cur_fb) and dpb_ref(si) /= REF_NONE then
+                            cntref := cntref + 1;
                         end if;
-                        st <= S_MK_CUR;
+                        if si /= to_integer(cur_fb) and dpb_ref(si) = REF_SHORT and (best < 0 or pn_si < best_v) then
+                            best := si;
+                            best_v <= pn_si;
+                        end if;
+                        cnt_ref <= cntref;
+                        best_i <= best;
+                        if si = C_NUM_FB - 1 then
+                            if cntref >= maximum(to_integer(act_sps.nrf), 1) and best >= 0 then
+                                dpb_ref(best) <= REF_NONE;
+                            end if;
+                            st <= S_MK_CUR;
+                        else
+                            si <= si + 1;
+                        end if;
 
                     when S_MK_CUR =>
                         if pic_cur_long = '0' then
@@ -1161,44 +1182,53 @@ begin
                         if sl_nref > 16 then
                             sl_nref <= to_unsigned(16, 6);
                         end if;
+                        si <= 0;
+                        best_i <= -1;
                         st <= S_RL_SHORT;
                     when S_RL_SHORT =>
-                        -- descending PicNum
-                        best := -1;
-                        for i in 0 to C_NUM_FB - 1 loop
-                            if i /= to_integer(cur_fb) and dpb_ref(i) = REF_SHORT and rl_taken(i) = '0' then
-                                if best < 0 then
-                                    best := i;
-                                elsif pn(i) > pn(best) then
-                                    best := i;
-                                end if;
+                        -- pick the not yet listed short-term picture with the largest PicNum
+                        pn_si := pic_num(dpb_fn(si), sl_fn, act_sps.log2fn);
+                        best := best_i;
+                        if si /= to_integer(cur_fb) and dpb_ref(si) = REF_SHORT and rl_taken(si) = '0' and
+                           (best < 0 or pn_si > best_v) then
+                            best := si;
+                            best_v <= pn_si;
+                        end if;
+                        best_i <= best;
+                        if si = C_NUM_FB - 1 then
+                            si <= 0;
+                            best_i <= -1;
+                            if best >= 0 and rl_len < 16 then
+                                rl(to_integer(rl_len)) <= to_unsigned(best, 5);
+                                rl_taken(best) <= '1';
+                                rl_len <= rl_len + 1;
+                            else
+                                st <= S_RL_LONG;
                             end if;
-                        end loop;
-                        if best >= 0 and rl_len < 16 then
-                            rl(to_integer(rl_len)) <= to_unsigned(best, 5);
-                            rl_taken(best) <= '1';
-                            rl_len <= rl_len + 1;
                         else
-                            st <= S_RL_LONG;
+                            si <= si + 1;
                         end if;
                     when S_RL_LONG =>
-                        -- ascending LongTermPicNum
-                        best := -1;
-                        for i in 0 to C_NUM_FB - 1 loop
-                            if i /= to_integer(cur_fb) and dpb_ref(i) = REF_LONG and rl_taken(i) = '0' then
-                                if best < 0 then
-                                    best := i;
-                                elsif dpb_lt(i) < dpb_lt(best) then
-                                    best := i;
-                                end if;
+                        -- then long-term pictures by ascending LongTermPicNum
+                        best := best_i;
+                        if si /= to_integer(cur_fb) and dpb_ref(si) = REF_LONG and rl_taken(si) = '0' and
+                           (best < 0 or signed(resize(dpb_lt(si), 18)) < best_v) then
+                            best := si;
+                            best_v <= signed(resize(dpb_lt(si), 18));
+                        end if;
+                        best_i <= best;
+                        if si = C_NUM_FB - 1 then
+                            si <= 0;
+                            best_i <= -1;
+                            if best >= 0 and rl_len < 16 then
+                                rl(to_integer(rl_len)) <= to_unsigned(best, 5);
+                                rl_taken(best) <= '1';
+                                rl_len <= rl_len + 1;
+                            else
+                                st <= S_SL_RPLM;
                             end if;
-                        end loop;
-                        if best >= 0 and rl_len < 16 then
-                            rl(to_integer(rl_len)) <= to_unsigned(best, 5);
-                            rl_taken(best) <= '1';
-                            rl_len <= rl_len + 1;
                         else
-                            st <= S_SL_RPLM;
+                            si <= si + 1;
                         end if;
                     when S_SL_RPLM =>
                         if rdy then
@@ -1249,21 +1279,26 @@ begin
                                     pnum := nwrap;
                                 end if;
                             end if;
-                            -- find the picture
-                            best := -1;
-                            for i in 0 to C_NUM_FB - 1 loop
-                                if i /= to_integer(cur_fb) then
-                                    if mod_idc = 2 then
-                                        if dpb_ref(i) = REF_LONG and signed(resize(dpb_lt(i), 18)) = pnum then
-                                            best := i;
-                                        end if;
-                                    else
-                                        if dpb_ref(i) = REF_SHORT and pn(i) = pnum then
-                                            best := i;
-                                        end if;
-                                    end if;
+                            pnum_r <= pnum;
+                            si <= 0;
+                            best_i <= -1;
+                            st <= S_RL_MODFIND;
+                        end if;
+                    when S_RL_MODFIND =>
+                        -- find the picture with PicNum / LongTermPicNum = pnum_r
+                        pn_si := pic_num(dpb_fn(si), sl_fn, act_sps.log2fn);
+                        best := best_i;
+                        if si /= to_integer(cur_fb) then
+                            if mod_idc = 2 then
+                                if dpb_ref(si) = REF_LONG and signed(resize(dpb_lt(si), 18)) = pnum_r then
+                                    best := si;
                                 end if;
-                            end loop;
+                            elsif dpb_ref(si) = REF_SHORT and pn_si = pnum_r then
+                                best := si;
+                            end if;
+                        end if;
+                        best_i <= best;
+                        if si = C_NUM_FB - 1 then
                             if best < 0 then
                                 err <= '1';
                                 rl_tgt <= FB_NONE;
@@ -1271,6 +1306,8 @@ begin
                                 rl_tgt <= to_unsigned(best, 5);
                             end if;
                             st <= S_RL_MODSHIFT;
+                        else
+                            si <= si + 1;
                         end if;
                     when S_RL_MODSHIFT =>
                         -- RefPicList[cIdx] = RefPicList[cIdx-1] for cIdx > refIdx; insert

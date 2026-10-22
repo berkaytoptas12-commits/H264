@@ -104,17 +104,22 @@ architecture rtl of h264_dec_top is
     signal slice_start, slice_done : std_logic;
     signal hdr_err, mbp_err : std_logic;
 
-    signal cw_en : std_logic;
-    signal cw_addr, cr_addr : unsigned(8 downto 0);
-    signal cw_data, cr_data : std_logic_vector(63 downto 0);
+    signal cw_en : std_logic_vector(3 downto 0);
+    signal cw_addr : unsigned(6 downto 0);
+    signal cw_data : std_logic_vector(255 downto 0);
+    signal cr_addr : unsigned(6 downto 0);
+    signal cr_data : std_logic_vector(255 downto 0);
     signal coef_free, pred_free, rec_free : std_logic;
 
     signal t_p, t_m, t_r : mbinfo_t;          -- tokens parser->mc, mc->recon, recon->deblock
     signal t_p_v, t_m_v, t_r_v : std_logic;
     signal mc_rdy, rc_rdy, db_rdy : std_logic;
 
-    signal pw_en, rw_en : std_logic_vector(15 downto 0);
-    signal pw_addr, pr_addr, rw_addr, rr_addr : unsigned(5 downto 0);
+    signal pw_en : std_logic_vector(15 downto 0);
+    signal rw_en : std_logic;
+    signal pw_addr, rw_addr, rr_addr : unsigned(5 downto 0);
+    signal pr_slot : std_logic;
+    signal pr_blk : unsigned(4 downto 0);
     signal pw_data, pr_data, rw_data, rr_data : std_logic_vector(127 downto 0);
 
     signal pic_done : std_logic;
@@ -154,8 +159,7 @@ begin
                   cw_en => cw_en, cw_addr => cw_addr, cw_data => cw_data, i_coef_free => coef_free,
                   o_mb => t_p, o_mb_valid => t_p_v, i_mb_ready => mc_rdy);
 
-    u_coef : entity work.h264_ram_sdp
-        generic map (G_AW => 9, G_DW => 64)
+    u_coef : entity work.h264_coefbuf
         port map (clk => clk, we => cw_en, waddr => cw_addr, wdata => cw_data, raddr => cr_addr, rdata => cr_data);
 
     u_mc : entity work.h264_mc
@@ -168,19 +172,19 @@ begin
                   m_rdata => m_axi_rdata, m_rlast => m_axi_rlast, m_rvalid => m_axi_rvalid,
                   m_rready => m_axi_rready);
 
-    u_pred : entity work.h264_pixbuf
-        generic map (G_AW => 6)
-        port map (clk => clk, we => pw_en, waddr => pw_addr, wdata => pw_data, raddr => pr_addr, rdata => pr_data);
+    u_pred : entity work.h264_predbuf
+        port map (clk => clk, we => pw_en, waddr => pw_addr, wdata => pw_data, rslot => pr_slot, rblk => pr_blk,
+                  rdata => pr_data);
 
     u_rec : entity work.h264_recon
         port map (clk => clk, rst => rst, i_mb => t_m, i_mb_valid => t_m_v, o_mb_ready => rc_rdy,
                   cr_addr => cr_addr, cr_data => cr_data, o_coef_free => coef_free,
-                  pr_addr => pr_addr, pr_data => pr_data, o_pred_free => pred_free,
+                  pr_slot => pr_slot, pr_blk => pr_blk, pr_data => pr_data, o_pred_free => pred_free,
                   rw_en => rw_en, rw_addr => rw_addr, rw_data => rw_data, i_rec_free => rec_free,
                   o_mb => t_r, o_mb_valid => t_r_v, i_mb_ready => db_rdy);
 
-    u_recbuf : entity work.h264_pixbuf
-        generic map (G_AW => 6)
+    u_recbuf : entity work.h264_ram_sdp
+        generic map (G_AW => 6, G_DW => 128)
         port map (clk => clk, we => rw_en, waddr => rw_addr, wdata => rw_data, raddr => rr_addr, rdata => rr_data);
 
     u_db : entity work.h264_deblock

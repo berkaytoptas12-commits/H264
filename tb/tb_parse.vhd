@@ -50,9 +50,9 @@ architecture sim of tb_parse is
     signal rel_fb : unsigned(4 downto 0) := (others => '0');
     signal hdr_err, mbp_err, stream_done : std_logic;
 
-    signal cw_en : std_logic;
-    signal cw_addr : unsigned(8 downto 0);
-    signal cw_data : std_logic_vector(63 downto 0);
+    signal cw_en : std_logic_vector(3 downto 0);
+    signal cw_addr : unsigned(6 downto 0);
+    signal cw_data : std_logic_vector(255 downto 0);
     signal coef_free : std_logic := '0';
     signal mb : mbinfo_t;
     signal mb_valid : std_logic;
@@ -124,9 +124,11 @@ begin
     process (clk)
     begin
         if rising_edge(clk) then
-            if cw_en = '1' then
-                coef_ram(to_integer(cw_addr)) <= cw_data;
-            end if;
+            for r in 0 to 3 loop
+                if cw_en(r) = '1' then
+                    coef_ram(to_integer(cw_addr) * 4 + r) <= cw_data(r * 64 + 63 downto r * 64);
+                end if;
+            end loop;
         end if;
     end process;
 
