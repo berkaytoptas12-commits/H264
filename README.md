@@ -691,9 +691,13 @@ kısmı, Libero yapılandırması ve gerçek DDR denetleyicisi.
 sudo kit/sim/cosim.sh streams qcif_ip
 ```
 
+RTL simülasyonu donanımdan binlerce kat yavaştır (CIF'te resim başına ~1 dakika). Bu yüzden betik PC
+programını uzun zaman aşımlarıyla çalıştırır (`H264_RTO=120`, `WAIT_S`); kitte bu ayarlar gerekmez.
+
 | Akış | Sonuç |
 |---|---|
 | qcif_ip (176x144, 8 kare) | Yazılım RTL köprüsünü buldu, ekran ayarı yazıldı. 8 resim çözüldü, `dec_error 0`, `disp_frames 8`. HDMI çıkışından 8 kare sırayla ve RGB olarak birebir, 0 TMDS hatası (37 479 APB erişimi) |
+| real_coffee_cif (352x288, 30 kare, fotoğraf klibi) | 30 resim çözüldü, `dec_error 0`, `dec_done 1`, `disp_frames 30`. HDMI çıkışından 30 kare sırayla ve birebir, 0 TMDS hatası (337 887 APB erişimi, ~37 dakika) |
 
 ### 11.2 Kitte çalıştırma sırası
 
