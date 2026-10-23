@@ -5,7 +5,8 @@
 
 Enter the kit's IP address (firmware in kit/, default 192.168.10.2), press
 "Bağlantıyı test et" to check the path PC -> MSS -> fabric, pick the video
-and press "Gönder".  Files that are not a Constrained Baseline Annex-B
+and press "Gönder".  The "Kit konsolu" tab shows the kit firmware's console,
+read over Ethernet (UDP port + 1), so no UART is needed.  Files that are not a Constrained Baseline Annex-B
 stream are converted with ffmpeg on the fly (size / bit rate from the
 fields).  The window shows the progress and the decoder status (pictures,
 resolution, errors) reported by the FPGA.
@@ -93,16 +94,59 @@ class App:
         self.dec = tk.StringVar(value="çözücü: -")
         ttk.Label(f, textvariable=self.dec).grid(row=6, column=0, columnspan=3, sticky="w")
 
-        self.log = tk.Text(f, height=12, width=80, state="disabled")
-        self.log.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
+        nb = ttk.Notebook(f)
+        nb.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
+        f.rowconfigure(7, weight=1)
+        tab_log = ttk.Frame(nb)
+        tab_con = ttk.Frame(nb)
+        nb.add(tab_log, text="Günlük")
+        nb.add(tab_con, text="Kit konsolu")
+        self.log = self.text_box(tab_log)
         for state, (_, colour) in STEP_STYLE.items():
             if colour:
                 self.log.tag_configure(state, foreground=colour)
-        f.rowconfigure(7, weight=1)
+        top = ttk.Frame(tab_con)
+        top.pack(fill="x", pady=(2, 2))
+        self.watch = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text="kit konsolunu izle", variable=self.watch).pack(side="left")
+        self.con_state = tk.StringVar(value="kit konsolu: -")
+        ttk.Label(top, textvariable=self.con_state).pack(side="left", padx=12)
+        ttk.Button(top, text="Temizle", command=lambda: self.clear(self.con)).pack(side="right")
+        self.con = self.text_box(tab_con)
+        self.con_job = None
+        self.kc = None                # KitConsole, used by one console job at a time
+        self.kc_key = None
 
         root.after(100, self.pump)
+        root.after(500, self.console_tick)
 
     # -- helpers -----------------------------------------------------------
+    @staticmethod
+    def text_box(parent):
+        box = ttk.Frame(parent)
+        box.pack(fill="both", expand=True)
+        t = tk.Text(box, height=12, width=80, state="disabled", wrap="word")
+        sb = ttk.Scrollbar(box, orient="vertical", command=t.yview)
+        t.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        t.pack(side="left", fill="both", expand=True)
+        return t
+
+    @staticmethod
+    def append(t, text, tags=()):
+        at_end = t.yview()[1] >= 0.999
+        t["state"] = "normal"
+        t.insert("end", text, tags)
+        t["state"] = "disabled"
+        if at_end:
+            t.see("end")
+
+    @staticmethod
+    def clear(t):
+        t["state"] = "normal"
+        t.delete("1.0", "end")
+        t["state"] = "disabled"
+
     def say(self, msg, tag=None):
         self.q.put(("log", (msg, tag)))
 
@@ -161,6 +205,41 @@ class App:
             return "Ağa ulaşılamıyor (%s). PC'nin Ethernet bağlantısını ve adresini kontrol edin." % e
         return str(e)
 
+    # -- kit console (over Ethernet) -----------------------------------------
+    def console_tick(self):
+        """every second: fetch new console text in the background (GUI thread)"""
+        if self.watch.get() and not (self.con_job and self.con_job.is_alive()):
+            try:
+                ip, port = self.ip.get().strip(), int(self.udp_port.get()) + 1
+            except ValueError:
+                ip = None
+            if ip:
+                self.con_job = threading.Thread(target=self.console_job, args=(ip, port), daemon=True)
+                self.con_job.start()
+        self.root.after(1000, self.console_tick)
+
+    def console_job(self, ip, port):
+        try:
+            if self.kc_key != (ip, port):
+                if self.kc:
+                    self.kc.close()
+                    self.q.put(("con", "── %s:%d ──\n" % (ip, port)))
+                self.kc, self.kc_key = hl.KitConsole(ip, port), (ip, port)
+            res = self.kc.read(timeout=0.3)
+        except OSError:
+            res = None
+        if res is None:
+            self.q.put(("con-state", "kit konsolu: yanıt yok (%s, UDP %d)" % (ip, port)))
+            return
+        text, note = res
+        self.q.put(("con-state", "kit konsolu: bağlı, kit %d sn'dir çalışıyor" % (self.kc.uptime // 1000)))
+        if note == "restart":
+            text = "── kit yeniden başladı ──\n" + text
+        elif note == "lost":
+            text = "…\n" + text
+        if text:
+            self.q.put(("con", text))
+
     # -- connection test -----------------------------------------------------
     def test_link(self):
         if self.busy():
@@ -181,7 +260,8 @@ class App:
         self.q.put(("idle", None))
 
     def run_test(self, cfg):
-        """PC address -> ping (MSS firmware) -> link STATUS (fabric); returns (ok, summary)"""
+        """PC address -> ping (MSS) -> firmware status (MSS) -> link STATUS (fabric);
+        returns (ok, summary)"""
         try:
             ip = socket.gethostbyname(cfg["ip"])
         except OSError:
@@ -209,53 +289,97 @@ class App:
         else:
             self.step("fail", "ping yanıt vermiyor")
 
-        # 3. link STATUS: answered by h264_link in the fabric, through the MSS
-        r = None
+        # 3. firmware status on UDP port + 1 (the first request also probes the fabric)
+        kc = self.kc
+        console_seen = (self.kc_key == (ip, cfg["port"] + 1) and kc is not None and kc.uptime is not None)
+        kit = None
         try:
-            s = self.open_sender(cfg)
+            c = hl.KitConsole(ip, cfg["port"] + 1)
+            try:
+                kit = c.info(timeout=0.4, tries=3)
+            finally:
+                c.close()
         except OSError as e:
             self.step("fail", "UDP soketi açılamadı: %s" % e)
-            s = None
-        try:
-            try:
-                r = s.status(tries=3, timeout=0.3) if s else None
-            except hl.LinkError:
-                r = None
-            if s and r is None:
-                self.step("fail", "fabric'ten yanıt yok (UDP %d, durum sorgusu 3 kez)" % cfg["port"])
+        fabric = kit.get("fabric") if kit else None
+        base = kit.get("fabric_base", "?") if kit else "?"
+        if kit is None:
+            self.step("fail", "kit yazılımı bilgi isteğine yanıt vermedi (UDP %d)" % (cfg["port"] + 1))
+        else:
+            up = int(kit.get("uptime_ms", "0") or 0) // 1000
+            self.step("ok", "kit yazılımı yanıt veriyor: %s, %d sn'dir çalışıyor, Ethernet bağlantısı %s"
+                      % (kit.get("fw", "?"), up, "var" if kit.get("link") == "1" else "yok"))
+            if fabric == "ok":
+                self.step("ok", "FPGA'daki köprü bulundu (h264_apb_bridge, %s)" % base)
             else:
-                rtt, lost = [], 0
-                for _ in range(10):
-                    t0 = time.monotonic()
-                    try:
-                        r = s.status(tries=1, timeout=0.3)
-                        rtt.append(time.monotonic() - t0)
-                    except hl.LinkError:
-                        lost += 1
-                if rtt:
-                    self.step("ok", "fabric yanıt veriyor (h264_link): gidiş-dönüş ort. %.2f ms, en çok "
-                              "%.2f ms, %d/10 yanıt" % (1e3 * sum(rtt) / len(rtt), 1e3 * max(rtt), len(rtt)))
-                else:
-                    self.step("warn", "fabric ilk sorguya yanıt verdi, sonraki 10 sorguya vermedi")
-                self.step("info", self.describe(r))
-                self.q.put(("dec", r))
-        finally:
-            if s:
-                s.port.close()
+                self.step("fail", "FPGA'daki köprü bulunamadı (%s adresinde ID okunamadı)" % base)
+
+        # 4. link STATUS: answered by h264_link in the fabric, through the MSS
+        if fabric == "missing":
+            self.step("skip", "köprü bulunamadığı için fabric durum sorgusu atlandı")
+            r = None
+        else:
+            r = self.probe_link(cfg)
 
         if r is not None:
             if r.error:
                 return True, "Bağlantı tamam. Çözücü hata bildiriyor; START ile (Gönder) sıfırlanır."
             return True, "Bağlantı tamam, video gönderilebilir."
+        if fabric == "missing":
+            return False, ("Kit yazılımı çalışıyor ama FPGA'daki köprüyü bulamadı. FPGA'ya h264_dec_mss_top "
+                           "içeren bitstream yüklü mü, FABRIC_BASE (%s) Libero bellek haritasındaki "
+                           "adresle aynı mı, FIC3 etkin mi?" % base)
+        if kit is not None:
+            return False, ("Kit yazılımı ve köprü çalışıyor ama h264_link yanıt vermiyor: fabric saatini "
+                           "ve reset'ini (h264_dec_mss_top) kontrol edin.")
+        if ping and console_seen:
+            return False, ("Kit konsolu az önce UDP'ye yanıt veriyordu, kit yazılımı şimdi vermiyor: FPGA'ya "
+                           "(FIC3) erişirken takılmış. MSS Configurator'da FIC3'ün etkin ve saatli olduğunu, "
+                           "FABRIC_BASE'in Libero bellek haritasındaki adresle aynı olduğunu kontrol edin; "
+                           "sonra kiti sıfırlayın.")
         if ping:
-            return False, ("Kit ağda ama fabric yanıt vermiyor. Kit konsolunda 'no h264_apb_bridge' "
-                           "yazıyor mu? FPGA'da h264_dec_mss_top yüklü mü, FIC3 adresi (FABRIC_BASE) "
-                           "ve saati doğru mu?")
+            return False, ("Kit ping'e yanıt veriyor ama UDP isteklerine vermiyor. Ya PC'nin güvenlik duvarı "
+                           "gelen UDP'yi engelliyor (Windows: Python'a izin verin) ya da kit yazılımı FPGA'ya "
+                           "(FIC3) erişirken takıldı: FIC3 etkin ve saatli mi, FABRIC_BASE doğru mu? Kit "
+                           "konsolu sekmesindeki son satıra bakın, kiti sıfırlayıp yeniden deneyin.")
         if local is None or not same:
             return False, "PC ile kit aynı ağda değil: önce PC'nin Ethernet adresini düzeltin."
-        return False, ("Kite ulaşılamıyor: kabloyu ve bağlantı ışıklarını, kitte yazılımın çalıştığını "
-                       "(konsolda 'link up') ve kitin IP adresini (kit/src/app_config.h, APP_IP) "
-                       "kontrol edin.")
+        return False, ("Kite ulaşılamıyor: kabloyu ve bağlantı ışıklarını, kitin IP adresini "
+                       "(kit/src/app_config.h, APP_IP) ve kitte yazılımın çalıştığını kontrol edin. Ağ "
+                       "hiç çalışmıyorsa kiti yalnızca isteğe bağlı UART konsolu ya da hata ayıklayıcı "
+                       "(SoftConsole) gösterebilir; kit az önce yanıt veriyorduysa sıfırlayın.")
+
+    def probe_link(self, cfg):
+        """STATUS requests to h264_link with round trip times; the response or None"""
+        try:
+            s = self.open_sender(cfg)
+        except OSError as e:
+            self.step("fail", "UDP soketi açılamadı: %s" % e)
+            return None
+        try:
+            try:
+                r = s.status(tries=3, timeout=0.3)
+            except hl.LinkError:
+                self.step("fail", "fabric'ten yanıt yok (UDP %d, durum sorgusu 3 kez)" % cfg["port"])
+                return None
+            rtt = []
+            for _ in range(10):
+                t0 = time.monotonic()
+                try:
+                    r = s.status(tries=1, timeout=0.3)
+                    rtt.append(time.monotonic() - t0)
+                except hl.LinkError:
+                    pass
+            if rtt:
+                self.step("ok", "fabric yanıt veriyor (h264_link): gidiş-dönüş ort. %.2f ms, en çok "
+                          "%.2f ms, %d/10 yanıt" % (1e3 * sum(rtt) / len(rtt), 1e3 * max(rtt), len(rtt)))
+            else:
+                self.step("warn", "fabric ilk sorguya yanıt verdi, sonraki 10 sorguya vermedi")
+            self.step("info", self.describe(r))
+            self.q.put(("dec", r))
+            return r
+        finally:
+            s.port.close()
 
     # -- actions -----------------------------------------------------------
     def status(self):
@@ -350,10 +474,11 @@ class App:
                 kind, v = self.q.get_nowait()
                 if kind == "log":
                     msg, tag = v
-                    self.log["state"] = "normal"
-                    self.log.insert("end", msg + "\n", (tag,) if tag else ())
-                    self.log.see("end")
-                    self.log["state"] = "disabled"
+                    self.append(self.log, msg + "\n", (tag,) if tag else ())
+                elif kind == "con":
+                    self.append(self.con, v)
+                elif kind == "con-state":
+                    self.con_state.set(v)
                 elif kind == "prog":
                     done, total, dt, last = v
                     if total:

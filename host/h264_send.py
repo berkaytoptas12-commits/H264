@@ -8,6 +8,8 @@
     ffmpeg -i cam.mp4 ... -f h264 - | h264_send.py -
                                                    stream from a pipe
     h264_send.py --status                          decoder status only
+    h264_send.py --info                            kit firmware status (fabric found, counters)
+    h264_send.py --console                         follow the kit's console (over Ethernet)
 
 Files that are not a Constrained Baseline Annex-B stream (.mp4, .mkv,
 High profile .264, ...) are converted with ffmpeg (must be in PATH) while
@@ -38,6 +40,41 @@ def human(n):
         n /= 1024.0
 
 
+def kit_console(ip, port, follow):
+    try:
+        c = hl.KitConsole(ip, port)
+    except OSError as e:
+        print("error: %s: %s" % (ip, e))
+        return 1
+    if not follow:
+        d = c.info()
+        if d is None:
+            print("no answer from the kit at %s (UDP %d)" % (ip, port))
+            return 1
+        for k, v in d.items():
+            print("%-14s %s" % (k, v))
+        return 0
+    print("kit console %s, UDP %d (Ctrl-C ends)" % (ip, port))
+    silent = False
+    try:
+        while True:
+            res = c.read()
+            if res is None:
+                if not silent:
+                    print("... no answer from the kit")
+                silent = True
+            else:
+                silent = False
+                text, note = res
+                if note:
+                    print("-- kit restarted --" if note == "restart" else "...")
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", nargs="?", help="video file (.264 / .h264 or anything ffmpeg reads), - = stdin")
@@ -45,6 +82,8 @@ def main():
                     help="IP address of the kit (default 192.168.10.2 or $H264_KIT_IP)")
     ap.add_argument("--port", type=int, default=hl.UDP_PORT, help="UDP port (default %d)" % hl.UDP_PORT)
     ap.add_argument("--status", action="store_true", help="only print the decoder status")
+    ap.add_argument("--info", action="store_true", help="print the kit firmware status")
+    ap.add_argument("--console", action="store_true", help="follow the kit console (Ctrl-C ends)")
     ap.add_argument("--convert", action="store_true", help="always convert with ffmpeg")
     ap.add_argument("--raw", action="store_true", help="never convert, send the file as it is")
     ap.add_argument("--size", help="output size when converting, e.g. 1280x720")
@@ -60,6 +99,10 @@ def main():
     if a.list:
         list_ports()
         return 0
+    if a.info or a.console:
+        if a.serial:
+            ap.error("--info / --console work over Ethernet only")
+        return kit_console(a.ip, a.port + 1, a.console)
     try:
         if a.serial:
             port, baud = hl.open_port(a.serial, a.baud)

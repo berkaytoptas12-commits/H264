@@ -28,7 +28,8 @@ int port_link_up(void);
 /* Free running millisecond counter. */
 uint32_t port_ms(void);
 
-/* Console output (printf style, no floating point). */
-void port_log(const char *fmt, ...);
+/* Raw console output (UART / stderr) for log.c; must not block for long,
+   may drop text when the output is busy. */
+void port_console(const char *s, uint32_t n);
 
 #endif

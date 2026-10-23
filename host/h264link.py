@@ -29,7 +29,7 @@ T_DATA, T_END, T_START, T_STATUS = 0x01, 0x02, 0x03, 0x04
 R_ACK, R_NAK, R_STATUS = 0x81, 0x82, 0x83
 MAXLEN = 1024
 WINDOW = 16
-UDP_PORT = 5000
+UDP_PORT = 5000               # link frames; the kit's console answers on UDP_PORT + 1
 UDP_BAUD = 100000000          # timing model of the Ethernet path (~80 Mbit/s payload)
 AUTO_BITRATE_MAX = 8000000    # default ffmpeg bit rate on fast links
 
@@ -338,6 +338,74 @@ class UdpPort:
     def reset_input_buffer(self):
         self._fill(0)
         self.buf.clear()
+
+    def close(self):
+        self.sock.close()
+
+
+class KitConsole:
+    """console text and status of the kit firmware over UDP (kit/src/service.c)"""
+
+    def __init__(self, host, port=UDP_PORT + 1):
+        self.addr = (socket.gethostbyname(host), port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.connect(self.addr)
+        self.offset = 0               # next console byte to fetch
+        self.uptime = None            # kit uptime at the last answer (ms)
+
+    def _ask(self, req, want, timeout, tries):
+        for _ in range(tries):
+            try:
+                self.sock.send(req)
+            except OSError:
+                pass
+            end = time.monotonic() + timeout
+            while True:
+                left = end - time.monotonic()
+                if left <= 0:
+                    break
+                self.sock.settimeout(left)
+                try:
+                    d = self.sock.recv(2048)
+                except socket.timeout:
+                    break
+                except OSError:               # ICMP error (unreachable): wait out the try
+                    time.sleep(min(left, 0.05))
+                    continue
+                if d[:5] == b"H264" + want:
+                    return d[5:]
+        return None
+
+    def info(self, timeout=0.3, tries=3):
+        """dict of the kit's "key=value" status lines, None without an answer"""
+        d = self._ask(b"H264I", b"i", timeout, tries)
+        if d is None:
+            return None
+        out = {}
+        for line in d.decode("utf-8", "replace").splitlines():
+            k, _, v = line.partition("=")
+            if k:
+                out[k] = v
+        return out
+
+    def read(self, timeout=0.3, tries=1):
+        """new console text since the last call as (text, note), None without an answer;
+        note: None, "lost" (older text overwritten in the kit) or "restart" (kit rebooted)"""
+        chunks, note = [], None
+        while True:
+            d = self._ask(b"H264L" + struct.pack("<I", self.offset), b"l", timeout, tries)
+            if d is None:
+                return ("".join(chunks), note) if chunks else None
+            first, total, uptime = struct.unpack("<III", d[:12])
+            if self.uptime is not None and (uptime < self.uptime or first < self.offset):
+                note, chunks = "restart", []
+            elif first > self.offset:
+                note = note or "lost"
+            self.uptime = uptime
+            self.offset = first + len(d) - 12
+            chunks.append(d[12:].decode("utf-8", "replace").replace("\r\n", "\n"))
+            if self.offset >= total:
+                return "".join(chunks), note
 
     def close(self):
         self.sock.close()

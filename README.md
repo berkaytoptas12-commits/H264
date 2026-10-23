@@ -430,8 +430,9 @@ Kaynak (yosys tahmini): köprü ~193 LUT, 163 FF, 1 LSRAM + 1 uSRAM, en uzun yol
   (HSS deposundaki `MSS_video-kit_mss_cfg.xml`) iki SGMII kanalı, MAC0/MAC1 saatleri ve MDIO pinleri
   (MSSIO 35/36) etkindir.
 * FIC3 etkin (APB), saati çözücü saati (9.1).
-* Konsol için MMUART0 (Video Kit referans tasarımında MMUART0/1 fabric üzerinden USB-UART'a gider;
-  kendi tasarımınızda da bağlı olmalı).
+* UART gerekmez: kit konsolu Ethernet üzerinden okunur (9.4). İsterseniz konsolun bir kopyası
+  MMUART0'a da gider (115200, beklemesiz); tasarımınızda MMUART0 bağlı değilse yazılımı
+  `KIT_UART_CONSOLE=0` ile derleyin.
 
 ### 9.3 Yazılım (`kit/`)
 
@@ -440,9 +441,11 @@ Kaynak (yosys tahmini): köprü ~193 LUT, 163 FF, 1 LSRAM + 1 uSRAM, en uzun yol
 | `kit/src/net.c` | Ethernet / ARP / IPv4 / ICMP echo (ping) / UDP; parçalama yok, yanıt isteğin geldiği MAC'e gider |
 | `kit/src/bridge.c` | UDP 5000 ↔ fabric: datagram baytları TXDATA4/TXDATA ile, yanıtlar 16 baytlık katlar hâlinde son göndericiye |
 | `kit/src/fabric_mmio.c` | `h264_apb_bridge` yazmaç erişimi (`FABRIC_BASE`) |
-| `kit/src/kit_main.c` | ana döngü, bağlantı durumu, 5 sn'de bir konsola istatistik |
-| `kit/src/app_config.h` | MAC (`02:00:00:48:32:64`), IP (`192.168.10.2/24`), UDP portu, `FABRIC_BASE` |
-| `kit/mss/port_mss.c` | Microchip MSS MAC sürücüsü (GEM, VSC8662), MMUART konsolu, SysTick |
+| `kit/src/service.c` | UDP 5001: konsol metni ve durum bilgisi (sürüm, çalışma süresi, fabric bulundu mu, sayaçlar, çözücü) |
+| `kit/src/log.c` | konsol: 8 KB'lık RAM halkası (PC buradan okur) + isteğe bağlı UART kopyası |
+| `kit/src/kit_main.c` | ana döngü, bağlantı durumu, trafik varken 10 sn'de bir konsola istatistik |
+| `kit/src/app_config.h` | MAC (`02:00:00:48:32:64`), IP (`192.168.10.2/24`), UDP portları (5000 video, 5001 konsol), `FABRIC_BASE` |
+| `kit/mss/port_mss.c` | Microchip MSS MAC sürücüsü (GEM, VSC8662), SysTick, beklemesiz UART kopyası |
 | `kit/mss/e51.c` | çekirdek giriş noktası (`KIT_HART=0` E51, `1` U54_1) |
 | `kit/sim/` | aynı kodun Linux derlemesi: TAP arayüzü + `host/fpga_emu.py` (kit olmadan test) |
 
@@ -457,7 +460,8 @@ VSC8662 PHY sürücüleri, bağlayıcı betikleri hazırdır):
 3. Tanımlar: örnek projedeki `TARGET_G5_SOC`, `MSS_MAC_SIMPLE_TX_QUEUE`; gerekirse `APP_IP`,
    `FABRIC_BASE` ve aşağıdaki kart ayarları (`-D...`).
 4. E51'de LIM/DDR'dan hata ayıklayıcıyla çalıştırın ya da eNVM'e yazın; HSS ile açılıyorsa
-   `KIT_HART=1` (U54_1). Konsol 115200 baud: IP, "link up" ve istatistikler.
+   `KIT_HART=1` (U54_1). Konsol mesajları (IP, "Ethernet link up", fabric durumu, istatistikler)
+   GUI'nin **Kit konsolu** sekmesinde ya da `h264_send.py --console` ile görünür.
 
 **Kart ayarları — Video Kit şemasından doğrulayın.** Varsayılanlar Microchip'in Icicle Kit
 örneğindeki VSC8662 bağlantısıdır; Video Kit için bunları donanımda doğrulayamadım:
@@ -470,8 +474,14 @@ VSC8662 PHY sürücüleri, bağlayıcı betikleri hazırdır):
 | `kit_board_phy_reset()` | boş (weak) | PHY reset'i bir MSS GPIO'suna bağlıysa bu fonksiyonu yazıp bırakın |
 | `FABRIC_BASE` | `0x40000000` | köprünün FIC3 adresi |
 
-Yazılım başlarken köprünün ID yazmacını okur; bulamazsa konsola `no h264_apb_bridge at ...`
-yazar ve saniyede bir yeniden dener (FIC3 adresi / saati / reset'i yanlışsa ilk ipucu budur).
+Yazılım önce ağı açar; fabric'teki köprüyü ilk istekte (bağlantı testi ya da gönderim) yoklar.
+ID yazmacı yanlış okunursa konsola `no h264_apb_bridge at ...` yazar ve saniyede bir yeniden dener.
+FIC3 hiç ayarlanmamışsa bu erişim işlemciyi kilitleyebilir; ağ önceden açıldığı için bağlantı testi
+bu durumu "ping vardı, istekten sonra yanıt kesildi" diye ayırt eder.
+
+**Ağ hiç çalışmıyorsa** (ör. PHY/MDIO ayarı yanlış, bağlantı ışığı yanmıyor) Ethernet konsolu da
+çalışmaz; ilk kurulumda kiti yalnızca isteğe bağlı UART kopyası ya da SoftConsole hata ayıklayıcısı
+gösterebilir.
 
 ### 9.4 PC tarafı
 
@@ -479,7 +489,7 @@ PC'nin Ethernet arayüzüne aynı alt ağdan sabit bir adres verin (ör. `192.16
 ya da bir anahtar üzerinden bağlayın; `ping 192.168.10.2` yanıt vermelidir.
 
 Kit DHCP kullanmaz; adresi yazılımda sabittir (`kit/src/app_config.h`: `APP_IP`, varsayılan
-`192.168.10.2`) ve açılışta kit konsoluna yazılır. Kiti mevcut bir ağa bağlayacaksanız o ağda boş bir
+`192.168.10.2`) ve kit konsolunun ilk satırlarında yazar. Kiti mevcut bir ağa bağlayacaksanız o ağda boş bir
 adresle derleyin (ör. `-DAPP_IP='IP4(192,168,1,50)'`).
 
 **Arayüz (`python host/h264_gui.py`):** Python 3.8+ ve Tkinter yeterlidir (pyserial gerekmez);
@@ -490,11 +500,17 @@ olduğunu söyler:
 | Adım | Ne denetlenir | Başarısızsa |
 |---|---|---|
 | PC adresi | PC'nin kite hangi adresle gideceği (kitle aynı /24 ağda mı?) | PC'nin Ethernet kartına kitin ağından sabit adres verin |
-| Ping | Kit ağda ve MSS yazılımı çalışıyor mu (yalnızca MSS yanıtlar) | kablo / bağlantı ışıkları, kit yazılımı (konsolda "link up"), `APP_IP` |
-| Durum sorgusu | MSS üzerinden fabric'teki `h264_link` yanıt veriyor mu; 10 sorguda gidiş-dönüş süresi | ping geçip bu adım kalıyorsa: FPGA'da `h264_dec_mss_top`, FIC3 adresi (`FABRIC_BASE`) ve saati; kit konsolunda "no h264_apb_bridge" |
+| Ping | Kit ağda mı (yalnızca MSS yanıtlar) | kablo / bağlantı ışıkları, `APP_IP`, kitte yazılım çalışıyor mu |
+| Kit yazılımı | UDP 5001 durum isteği: sürüm, çalışma süresi, Ethernet bağlantısı; **FPGA'daki köprü bulundu mu** | köprü bulunamadıysa: bitstream'de `h264_dec_mss_top`, `FABRIC_BASE`, FIC3; ping var ama yanıt yoksa: PC güvenlik duvarı ya da FIC3 erişiminde takılma (konsol daha önce yanıt verdiyse doğrudan takılma denir) |
+| Durum sorgusu | MSS üzerinden fabric'teki `h264_link` yanıt veriyor mu; 10 sorguda gidiş-dönüş süresi | köprü var ama bu adım kalıyorsa: fabric saati / reset'i |
 
-Test çözücüyü sıfırlamaz (yalnızca STATUS sorar); çözücü durumu (resim sayısı, çözünürlük, FIFO)
+Test çözücüyü sıfırlamaz (yalnızca durum sorar); çözücü durumu (resim sayısı, çözünürlük, FIFO)
 pencerenin alt satırında görünür.
+
+**Kit konsolu sekmesi:** "kit konsolunu izle" işaretliyken GUI saniyede bir kitten yeni konsol
+satırlarını ister (UDP port + 1 = 5001) ve gösterir; kit yeniden başlarsa "── kit yeniden başladı ──"
+yazar. Kit son 8 KB'lık konsol metnini sakladığı için GUI'yi sonradan açsanız da açılış mesajlarını
+görürsünüz.
 
 **Komut satırı:**
 
@@ -502,6 +518,8 @@ pencerenin alt satırında görünür.
 python host/h264_send.py film.mp4 --size 1920x1080 --bitrate 8M    # kit 192.168.10.2 (varsayılan)
 python host/h264_send.py --ip 192.168.1.50 video.264                # Baseline dosya olduğu gibi
 python host/h264_send.py --status                                   # çözücü durumu
+python host/h264_send.py --info                                     # kit yazılımı durumu (fabric bulundu mu, sayaçlar)
+python host/h264_send.py --console                                  # kit konsolunu canlı izle (Ctrl-C)
 ffmpeg -re -i giris.mp4 -an -vf format=yuv420p -c:v libx264 -profile:v baseline -tune zerolatency \
        -x264-params bframes=0:cabac=0:8x8dct=0:weightp=0 -b:v 6M -f h264 - \
   | python host/h264_send.py -                                      # canlı akış (stdin)
@@ -517,7 +535,7 @@ Windows'ta güvenlik duvarı Python'a gelen UDP yanıtlarını engellerse izin v
 |---|---|---|
 | `scripts/run_sim.sh apb streams <ad>` (`tb/tb_apb.vhd`) | Yazılımın yerine geçen APB master, Python'un ürettiği çerçeveleri TXDATA4/TXDATA ile yazar, yanıtları RXDATA'dan okur: TXFREE ile kredi bekleme, bozuk çerçeve (NAK + yeniden gönderme), tekrar çerçeve, END, CTRL sıfırlama; yanıtlar Python ayrıştırıcıyla denetlenir | qcif_ip, real_coffee_cif, hd720: çıktı birebir, `tlast` son baytta |
 | `kit/sim/test_udp.sh <akış.264>` (Linux derlemesi, TAP + FPGA modeli; root) | Gerçek ağ yığını üzerinden ping ve `h264_send.py --ip ...`; `KIT_LOSS` ile iki yönde paket kaybı | 4.6 MB 1080p akış: kayıpsız 83 Mbit/s, %1 kayıp 26.7 Mbit/s, %5 kayıp 5.9 Mbit/s — hepsi birebir; ffmpeg'den canlı boru (1080p, 6 Mbit/s) birebir; GUI ile MP4 dönüştürerek gönderme |
-| GUI, Xvfb altında `kit/sim`'e karşı | "Bağlantıyı test et": (1) her şey çalışıyor, (2) MSS yazılımı çalışıyor ama fabric sessiz, (3a) kit yok ve PC başka ağda, (3b) aynı ağda yanlış IP; ardından gönderme (.264 dosyası; High profil MP4 dönüştürülerek, %1 paket kaybıyla) | Dört durumda da doğru adım başarısız ve doğru öneri gösterildi; gönderilen akışlar birebir, MP4'ten üretilen akış Constrained Baseline ve C modeliyle ffmpeg aynı çözüyor |
+| GUI, Xvfb altında `kit/sim`'e karşı | "Bağlantıyı test et": her şey çalışıyor; köprünün ID'si okunamıyor (`KIT_NO_FABRIC=1`); ilk FIC3 erişimi takılıyor (`KIT_FABRIC_HANG=1`); kit yok ve PC başka ağda; aynı ağda yanlış IP. Kit konsolu sekmesi; ardından gönderme (.264 dosyası; High profil MP4 dönüştürülerek, %1 paket kaybıyla) | Her durumda doğru adım başarısız ve doğru öneri gösterildi; konsol açılış mesajlarını ve fabric yoklamasını gösteriyor; gönderilen akışlar birebir, MP4'ten üretilen akış Constrained Baseline ve C modeliyle ffmpeg aynı çözüyor |
 | RISC-V derleme denetimi | `kit/` yazılımının tamamı clang ile `rv64imac`/`lp64` hedefine, Microchip `platform` deposunun HAL ve MSS MAC/UART sürücü başlıklarına ve Video Kit referans MSS XML'inden üretilmiş `fpga_design_config`'e karşı derlendi (`-Wall -Wextra`, uyarısız); kullanılan tüm sürücü sembollerinin tanımlı olduğu kontrol edildi | Bağlanıp (link) donanımda çalıştırılmadı |
 
 Kitte çalıştırmak için: 9.1–9.3'teki adres/saat/PHY ayarları doğrulanmalıdır. Simülasyonda hız
@@ -549,6 +567,7 @@ libero/   create_project.tcl (Libero SoC projesi + sentez), h264_dec.sdc, uart_p
 * Seri PC bağlantısı UART hızıyla sınırlıdır (2–4 Mbaud). Ethernet yolu (bölüm 9) simülasyonda ve
   RISC-V derleme denetiminde doğrulandı, kitte çalıştırılmadı; Video Kit'in PHY/MDIO bağlantısı,
   PHY reset'i ve FIC3 adresi/saati kart üzerinde doğrulanmalıdır. FIC3 APB'si çözücüyle aynı saatte
-  olmalıdır (saat alanı geçişi yok).
+  olmalıdır (saat alanı geçişi yok). Kit konsolu Ethernet üzerindendir; ağ hiç kurulamıyorsa ilk
+  kurulumda UART kopyası ya da hata ayıklayıcı gerekebilir.
 * Olası iyileştirmeler: deblock'ta MB yüklemesini önceki MB'nin çıkışıyla örtüştürmek, CAVLC'de
   level + run_before'u tek adımda çözmek, tahmin tamponunu LSRAM'e taşımak.

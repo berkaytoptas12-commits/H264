@@ -17,7 +17,9 @@ typedef struct {
     uint16_t port;
 } net_peer_t;
 
-typedef void (*net_udp_handler_t)(const net_peer_t *from, const uint8_t *data, uint32_t len);
+/* called for every UDP datagram to our address; `port` = destination port */
+typedef void (*net_udp_handler_t)(uint16_t port, const net_peer_t *from, const uint8_t *data,
+                                  uint32_t len);
 
 typedef struct {
     uint32_t rx_frames, rx_arp, rx_icmp, rx_udp;
@@ -27,14 +29,13 @@ typedef struct {
 
 extern net_stats_t g_net_stats;
 
-void net_init(const uint8_t mac[6], uint32_t ip, uint32_t netmask, uint16_t udp_port,
-              net_udp_handler_t handler);
+void net_init(const uint8_t mac[6], uint32_t ip, uint32_t netmask, net_udp_handler_t handler);
 
 /* Process one received frame; the buffer is reused for ARP / ping replies. */
 void net_input(uint8_t *frame, uint32_t len);
 
-/* Send `len` bytes (<= NET_UDP_MAX) from our UDP port to `to`.  0 on success. */
-int net_udp_send(const net_peer_t *to, const uint8_t *data, uint32_t len);
+/* Send `len` bytes (<= NET_UDP_MAX) from UDP port `sport` to `to`.  0 on success. */
+int net_udp_send(const net_peer_t *to, uint16_t sport, const uint8_t *data, uint32_t len);
 
 /* Tell the network who we are (gratuitous ARP). */
 void net_announce(void);

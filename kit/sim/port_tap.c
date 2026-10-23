@@ -9,7 +9,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +21,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 
+#include "log.h"
 #include "port.h"
 #include "sim.h"
 
@@ -90,7 +90,8 @@ int port_init(const uint8_t mac[6])
     }
     fcntl(g_fd, F_SETFL, O_NONBLOCK);
     host_side(ifr.ifr_name, host);
-    port_log("TAP %s, PC side %s, loss %.3f", ifr.ifr_name, host, g_loss);
+    kit_log("TAP %s, PC side %s, loss %d.%03d", ifr.ifr_name, host, (int)g_loss,
+            (int)(g_loss * 1000) % 1000);
     return 0;
 }
 
@@ -141,15 +142,9 @@ uint32_t port_ms(void)
     return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000);
 }
 
-void port_log(const char *fmt, ...)
+void port_console(const char *s, uint32_t n)
 {
-    va_list ap;
-
-    fprintf(stderr, "[kit %7.3f] ", port_ms() / 1000.0);
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-    fputc('\n', stderr);
+    fwrite(s, 1, n, stderr);
 }
 
 uint32_t sim_dropped(void)

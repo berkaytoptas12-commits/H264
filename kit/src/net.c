@@ -16,7 +16,6 @@ net_stats_t g_net_stats;
 
 static uint8_t  g_mac[6];
 static uint32_t g_ip, g_mask;
-static uint16_t g_port;
 static uint16_t g_ip_id;
 static net_udp_handler_t g_handler;
 static uint8_t  g_tx[ETH_HLEN + NET_MTU];
@@ -72,13 +71,11 @@ static void send_frame(const uint8_t *f, uint32_t len)
         g_net_stats.tx_fail++;
 }
 
-void net_init(const uint8_t mac[6], uint32_t ip, uint32_t netmask, uint16_t udp_port,
-              net_udp_handler_t handler)
+void net_init(const uint8_t mac[6], uint32_t ip, uint32_t netmask, net_udp_handler_t handler)
 {
     memcpy(g_mac, mac, 6);
     g_ip = ip;
     g_mask = netmask;
-    g_port = udp_port;
     g_handler = handler;
     memset(&g_net_stats, 0, sizeof g_net_stats);
 }
@@ -167,8 +164,6 @@ static void udp_input(const uint8_t *f, const uint8_t *ip, uint32_t ihl, uint32_
     ulen = get16(u + 4);
     if (ulen < 8u || ulen > tot - ihl)
         goto drop;
-    if (get16(u + 2) != g_port)
-        return;
     if (get16(u + 6) != 0 && udp_csum(get32(ip + 12), get32(ip + 16), u, ulen) != 0)
         goto drop;
     g_net_stats.rx_udp++;
@@ -176,7 +171,7 @@ static void udp_input(const uint8_t *f, const uint8_t *ip, uint32_t ihl, uint32_
     from.ip = get32(ip + 12);
     from.port = get16(u);
     if (g_handler)
-        g_handler(&from, u + 8, ulen - 8u);
+        g_handler(get16(u + 2), &from, u + 8, ulen - 8u);
     return;
 drop:
     g_net_stats.rx_drop++;
@@ -228,7 +223,7 @@ drop:
     g_net_stats.rx_drop++;
 }
 
-int net_udp_send(const net_peer_t *to, const uint8_t *data, uint32_t len)
+int net_udp_send(const net_peer_t *to, uint16_t sport, const uint8_t *data, uint32_t len)
 {
     uint8_t *f = g_tx, *ip = f + ETH_HLEN, *u = ip + 20;
     uint32_t n;
@@ -249,7 +244,7 @@ int net_udp_send(const net_peer_t *to, const uint8_t *data, uint32_t len)
     put32(ip + 12, g_ip);
     put32(ip + 16, to->ip);
     put16(ip + 10, csum_fold(csum_add(0, ip, 20u)));
-    put16(u, g_port);
+    put16(u, sport);
     put16(u + 2, to->port);
     put16(u + 4, 8u + len);
     put16(u + 6, 0);

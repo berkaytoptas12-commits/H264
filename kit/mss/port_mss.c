@@ -1,15 +1,14 @@
 /*
  * port_mss.c - port.h on the PolarFire SoC MSS: Ethernet through the
- * Microchip MSS MAC driver (GEM, SGMII, VSC8662 PHY), console on an MMUART,
- * time from the hart's SysTick.
+ * Microchip MSS MAC driver (GEM, SGMII, VSC8662 PHY), time from the hart's
+ * SysTick.  The console is read over Ethernet (service.c); a copy also goes
+ * to an MMUART without blocking (KIT_UART_CONSOLE=0 leaves the UART alone).
  *
  * Board settings below default to the Icicle Kit style wiring (data on GEM0,
  * PHY VSC8662 port 0 at MDIO address 8, MDIO pins owned by GEM1).  Check
  * them against the Video Kit schematic / MSS Configurator and override with
  * -D on the compiler command line when they differ.
  */
-#include <stdarg.h>
-#include <stdio.h>
 #include <string.h>
 
 #include "mpfs_hal/mss_hal.h"
@@ -32,8 +31,12 @@
 #ifndef KIT_PHY_ADDR            /* MSS_MAC_AUTO_DETECT_PHY_ADDRESS scans the bus */
 #define KIT_PHY_ADDR    PHY_VSC8662_0_MDIO_ADDR
 #endif
+#ifndef KIT_UART_CONSOLE        /* 1: copy of the console on an MMUART (115200 8N1) */
+#define KIT_UART_CONSOLE 1
+#endif
 #ifndef KIT_UART
 #define KIT_UART        g_mss_uart0_lo
+#define KIT_UART_PERIPH MSS_PERIPH_MMUART0
 #endif
 #ifndef KIT_HART                /* hart running the firmware: 0 = E51, 1 = U54_1 */
 #define KIT_HART        0
@@ -74,23 +77,40 @@ uint32_t port_ms(void)
 }
 
 /* ------------------------------------------------------------- console --- */
-void port_log(const char *fmt, ...)
-{
-    char buf[200];
-    va_list ap;
-    int n;
+/* UART copy of the console: queued here, handed to the 16 byte TX FIFO from
+   port_poll() whenever it is empty, so logging never waits for the UART */
+#if KIT_UART_CONSOLE
+#define CON_SIZE        2048u   /* power of two */
+static char g_con[CON_SIZE];
+static uint32_t g_con_wr, g_con_rd;
+#endif
 
-    va_start(ap, fmt);
-    n = vsnprintf(buf, sizeof buf - 2u, fmt, ap);
-    va_end(ap);
-    if (n < 0)
-        return;
-    if (n > (int)sizeof buf - 3)
-        n = (int)sizeof buf - 3;
-    buf[n++] = '\r';
-    buf[n++] = '\n';
-    buf[n] = 0;
-    MSS_UART_polled_tx_string(&KIT_UART, (const uint8_t *)buf);
+void port_console(const char *s, uint32_t n)
+{
+#if KIT_UART_CONSOLE
+    uint32_t i;
+
+    for (i = 0; i < n && g_con_wr - g_con_rd < CON_SIZE; i++)
+        g_con[g_con_wr++ & (CON_SIZE - 1u)] = s[i];
+#else
+    (void)s;
+    (void)n;
+#endif
+}
+
+static void console_poll(void)
+{
+#if KIT_UART_CONSOLE
+    uint8_t chunk[16];
+    uint32_t n = 0;
+
+    while (n < sizeof chunk && g_con_rd + n != g_con_wr) {
+        chunk[n] = (uint8_t)g_con[(g_con_rd + n) & (CON_SIZE - 1u)];
+        n++;
+    }
+    if (n)
+        g_con_rd += (uint32_t)MSS_UART_fill_tx_fifo(&KIT_UART, chunk, n);
+#endif
 }
 
 /* ------------------------------------------------------------ Ethernet --- */
@@ -155,10 +175,12 @@ int port_init(const uint8_t mac[6])
     mss_mac_cfg_t cfg;
     uint32_t i;
 
-    (void)mss_config_clk_rst(MSS_PERIPH_MMUART0, (uint8_t)KIT_HART, PERIPHERAL_ON);
     (void)mss_config_clk_rst(MSS_PERIPH_FIC3, (uint8_t)KIT_HART, PERIPHERAL_ON);   /* APB to the decoder */
+#if KIT_UART_CONSOLE
+    (void)mss_config_clk_rst(KIT_UART_PERIPH, (uint8_t)KIT_HART, PERIPHERAL_ON);
     MSS_UART_init(&KIT_UART, MSS_UART_115200_BAUD,
                   MSS_UART_DATA_8_BITS | MSS_UART_NO_PARITY | MSS_UART_ONE_STOP_BIT);
+#endif
     SysTick_Config();
     __enable_irq();
 
@@ -241,6 +263,8 @@ uint32_t port_eth_recv(uint8_t *buf, uint32_t max)
 
 void port_poll(void)
 {
+    console_poll();
+
     /* start queued transmissions while the MAC takes them */
     while (g_txq_rd != g_txq_wr) {
         uint32_t s = g_txq[g_txq_rd % TX_SLOTS];

@@ -3,6 +3,8 @@
  * (a model of h264_link + decoder FIFO) through pipes.
  *
  *   KIT_EMU_ARGS="--out rx.264 --drain 2e6"   extra emulator arguments
+ *   KIT_NO_FABRIC=1      the bridge's ID register reads wrong (no bitstream / wrong address)
+ *   KIT_FABRIC_HANG=1    the first register access never returns (FIC3 not set up)
  */
 #include <signal.h>
 #include <stdio.h>
@@ -35,6 +37,11 @@ int fabric_init(void)
 
     if (g_pid > 0)
         return 0;
+    if (getenv("KIT_FABRIC_HANG"))
+        for (;;)
+            pause();
+    if (getenv("KIT_NO_FABRIC"))
+        return -1;
     if (pipe(a) < 0 || pipe(b) < 0)
         return -1;
     argv[n++] = "python3";

@@ -16,7 +16,10 @@
 #define APP_NETMASK     IP4(255, 255, 255, 0)
 #endif
 #ifndef APP_UDP_PORT
-#define APP_UDP_PORT    5000u
+#define APP_UDP_PORT    5000u           /* link frames (h264_link) */
+#endif
+#ifndef APP_CONSOLE_PORT
+#define APP_CONSOLE_PORT (APP_UDP_PORT + 1u)  /* console text and status for the PC (service.c) */
 #endif
 
 /* Base address of h264_apb_bridge (FIC3 APB window, see the Libero memory map). */
@@ -29,10 +32,12 @@
 #define BRIDGE_TX_TIMEOUT_MS    20u
 #endif
 
-/* Statistics on the console every N ms (0 = off). */
+/* Statistics on the console every N ms while there is traffic (0 = off). */
 #ifndef APP_STATS_MS
-#define APP_STATS_MS    5000u
+#define APP_STATS_MS    10000u
 #endif
+
+#define APP_VERSION     "h264-bridge 1.1"
 
 #define IP4(a, b, c, d) (((unsigned long)(a) << 24) | ((unsigned long)(b) << 16) | \
                          ((unsigned long)(c) << 8) | (unsigned long)(d))
