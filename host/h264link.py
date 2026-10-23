@@ -24,6 +24,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 
 T_DATA, T_END, T_START, T_STATUS = 0x01, 0x02, 0x03, 0x04
@@ -437,6 +438,23 @@ def local_address(host, port=UDP_PORT):
         s.close()
 
 
+# no console window for helper programs started from the GUI (Windows)
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def find_tool(name):
+    """path of an external program (ffmpeg, ffprobe): first next to this program
+    (h264_gui.exe with ffmpeg.exe beside it, or in ffmpeg\\bin there), then PATH"""
+    frozen = getattr(sys, "frozen", False)
+    here = os.path.dirname(os.path.abspath(sys.executable if frozen else __file__))
+    exe = name + ".exe" if sys.platform.startswith("win") else name
+    for d in (here, os.path.join(here, "bin"), os.path.join(here, "ffmpeg"), os.path.join(here, "ffmpeg", "bin")):
+        p = os.path.join(d, exe)
+        if os.path.isfile(p):
+            return p
+    return shutil.which(name)
+
+
 def system_ping(host, timeout=1.0):
     """one ICMP echo with the system ping command: True / False, None if there is none"""
     exe = shutil.which("ping")
@@ -449,8 +467,8 @@ def system_ping(host, timeout=1.0):
     else:
         cmd = [exe, "-c", "1", "-W", str(max(1, round(timeout))), host]
     try:
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout + 5,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=timeout + 5, creationflags=NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired):
         return False
     # Windows ping exits with 0 on "destination host unreachable" too; only real replies carry TTL
@@ -606,14 +624,14 @@ def video_fps(path):
         f = sps_fps(path)
         if f and 1 <= f <= 240:
             return f
-    exe = shutil.which("ffprobe")
+    exe = find_tool("ffprobe")
     if not exe:
         return None
     try:
         out = subprocess.run([exe, "-v", "error", "-select_streams", "v:0", "-show_entries",
                               "stream=avg_frame_rate,r_frame_rate", "-of", "default=nw=1", path],
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.decode()
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=20, creationflags=NO_WINDOW).stdout.decode()
     except (OSError, subprocess.TimeoutExpired):
         return None
     vals = dict(l.split("=", 1) for l in out.split() if "=" in l)
@@ -631,7 +649,7 @@ def video_fps(path):
 def ffmpeg_cmd(src, size=None, bitrate=None, fps=None, out="-"):
     """ffmpeg command that turns any video into a Constrained Baseline
     Annex-B stream (pipe to stdout with out='-')"""
-    exe = shutil.which("ffmpeg") or "ffmpeg"
+    exe = find_tool("ffmpeg") or "ffmpeg"
     cmd = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-i", src, "-an"]
     vf = []
     if size:
@@ -653,7 +671,11 @@ def ffmpeg_cmd(src, size=None, bitrate=None, fps=None, out="-"):
 
 def ffmpeg_chunks(src, size=None, bitrate=None, fps=None, chunk=16 * 1024):
     """converted stream straight from ffmpeg's stdout"""
-    proc = subprocess.Popen(ffmpeg_cmd(src, size, bitrate, fps), stdout=subprocess.PIPE)
+    if not find_tool("ffmpeg"):
+        raise LinkError("ffmpeg not found: put ffmpeg.exe next to this program or into PATH")
+    err = tempfile.TemporaryFile()
+    proc = subprocess.Popen(ffmpeg_cmd(src, size, bitrate, fps), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=err, creationflags=NO_WINDOW)
     try:
         while True:
             b = proc.stdout.read(chunk)
@@ -663,8 +685,11 @@ def ffmpeg_chunks(src, size=None, bitrate=None, fps=None, chunk=16 * 1024):
     finally:
         proc.stdout.close()
         rc = proc.wait()
+        err.seek(0)
+        msg = err.read().decode(errors="replace").strip().splitlines()
+        err.close()
         if rc != 0:
-            raise LinkError("ffmpeg failed (exit code %d)" % rc)
+            raise LinkError("ffmpeg failed (exit code %d)%s" % (rc, ": " + msg[-1] if msg else ""))
 
 
 def parse_bitrate(s):

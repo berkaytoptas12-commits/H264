@@ -14,6 +14,7 @@ resolution, errors) reported by the FPGA.
 import os
 import queue
 import socket
+import sys
 import threading
 import time
 import tkinter as tk
@@ -21,7 +22,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import h264link as hl
 
-KIT_IP = "192.168.10.2"
+KIT_IP = os.environ.get("H264_KIT_IP", "192.168.10.2")   # same default as h264_send.py
 SIZES = ["orijinal", "1920x1080", "1280x720", "854x480", "640x480", "352x288"]
 # connection test: line prefix and colour per step state
 STEP_STYLE = {
@@ -476,6 +477,11 @@ class App:
             prof = hl.sps_profile(path) if os.path.splitext(path)[1].lower() in (".264", ".h264") else None
             if prof is None or prof[0] != 66:
                 convert = True
+            if convert and not hl.find_tool("ffmpeg"):
+                self.q.put(("err", "Bu dosya dönüştürülmeli ama ffmpeg bulunamadı. libx264'lü ffmpeg.exe'yi "
+                                   "bu programın yanına (ya da yanındaki ffmpeg\\bin klasörüne) koyun veya "
+                                   "PATH'e ekleyin. Constrained Baseline .264 dosyaları ffmpeg olmadan gönderilir."))
+                return
             if convert:
                 size = None if cfg["size"] == "orijinal" else tuple(int(v) for v in cfg["size"].split("x"))
                 br = cfg["bitrate"]
@@ -560,6 +566,12 @@ class App:
 
 
 def main():
+    if sys.platform.startswith("win"):
+        try:                    # sharp text on scaled (high DPI) Windows displays
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except (AttributeError, OSError):
+            pass
     root = tk.Tk()
     App(root)
     root.mainloop()

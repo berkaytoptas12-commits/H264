@@ -494,8 +494,25 @@ Kit DHCP kullanmaz; adresi yazılımda sabittir (`kit/src/app_config.h`: `APP_IP
 `192.168.10.2`) ve kit konsolunun ilk satırlarında yazar. Kiti mevcut bir ağa bağlayacaksanız o ağda boş bir
 adresle derleyin (ör. `-DAPP_IP='IP4(192,168,1,50)'`).
 
+**Windows için hazır programlar (Python gerekmez):** `h264_gui.exe` (arayüz) ve `h264_send.exe`
+(komut satırı) tek dosyadır; 64 bit Windows 10/11'de çift tıklayarak çalışır.
+* MP4/MKV dönüştürmek için libx264'lü `ffmpeg.exe` gerekir (ör. gyan.dev "essentials" ya da BtbN
+  "gpl" derlemesi). `ffmpeg.exe` ve `ffprobe.exe`'yi exe'nin yanına ya da yanındaki `ffmpeg\bin`
+  klasörüne koyun ya da PATH'e ekleyin. Hazır Constrained Baseline `.264` dosyaları ffmpeg olmadan
+  gönderilir.
+* İmzasız oldukları için ilk açılışta Windows SmartScreen uyarı verebilir ("Ek bilgi" →
+  "Yine de çalıştır"). Güvenlik duvarı sorarsa özel ağa izin verin.
+* Derleme: Windows'ta `host\build_exe.bat` (python.org Python'u ile PyInstaller). Linux'ta Windows
+  olmadan `scripts/build_exe_wine.sh` (Wine, conda-forge'un win-64 Python'u ve PyInstaller). İkisi
+  de çıktıyı `host/dist/` altına yazar.
+* Doğrulama: Linux'ta derlenen exe'ler Wine altında `kit/sim`'e karşı denendi. GUI'de "Bağlantıyı
+  test et" adımlarının hepsi ✔ geçti; GUI'den ve `h264_send.exe`'den gönderilen akışlar birebir
+  ulaştı; ffmpeg yokken MP4 seçilince doğru uyarı çıktı. Gerçek bir Windows makinesinde
+  denenmedi.
+
 **Arayüz (`python host/h264_gui.py`):** Python 3.8+ ve Tkinter yeterlidir (pyserial gerekmez);
-dönüştürme için PATH'te libx264'lü ffmpeg. "Kit IP" ve "UDP port" alanlarını doldurun, önce
+dönüştürme için libx264'lü ffmpeg (PATH'te ya da betiğin yanında). "Kit IP" ve "UDP port" alanlarını
+doldurun (varsayılan IP `H264_KIT_IP` ortam değişkeninden de verilebilir), önce
 **Bağlantıyı test et**, sonra videoyu seçip **Gönder**. Test, yolu adım adım dener ve sorunun nerede
 olduğunu söyler:
 
@@ -744,8 +761,8 @@ geçmeden sonrakine geçmeyin.
 
 7. Kiti PC'ye doğrudan kabloyla bağlayın (GEM0'a giden RJ45). PC'nin Ethernet kartına
    `192.168.10.1 / 255.255.255.0` verin.
-8. `python host/h264_gui.py` → **Bağlantıyı test et**. Dört adımın hepsi ✔ olmalıdır: PC adresi,
-   ping, kit yazılımı + "köprü bulundu", fabric yanıtı.
+8. `h264_gui.exe`'yi (ya da `python host/h264_gui.py`) açın → **Bağlantıyı test et**. Dört adımın
+   hepsi ✔ olmalıdır: PC adresi, ping, kit yazılımı + "köprü bulundu", fabric yanıtı.
 
    **Olmazsa** test hangi adımın kaldığını ve olası nedeni yazar:
    * PC adresi kalıyorsa: PC'nin IP ayarı;
@@ -782,9 +799,10 @@ rtl/      VHDL-2008 RTL (çözücü; h264_uart / h264_link / h264_dec_uart_top: 
           h264_axi_rd_arb / h264_dec_hdmi_top: HDMI çıkışı)
 tb/       GHDL testbench'leri (tb_parse, tb_top, tb_link, tb_apb, tb_disp, tb_cosim, tb_util_pkg)
 scripts/  gen_streams.sh, stream_tools.py, gen_tables.py, run_sim.sh, yuvcmp.py,
-          synth_estimate.sh, pf_depth.py, disp_check.py
+          synth_estimate.sh, pf_depth.py, disp_check.py, build_exe_wine.sh (Windows exe'leri, Linux'ta)
 host/     PC programları: h264_send.py (komut satırı), h264_gui.py (arayüz), h264link.py (protokol,
-          seri ve UDP), fpga_emu.py (FPGA tarafının yazılım modeli), test_link.py, make_vectors.py
+          seri ve UDP), fpga_emu.py (FPGA tarafının yazılım modeli), test_link.py, make_vectors.py,
+          build_exe.bat (Windows exe'leri, Windows'ta)
 kit/      MSS bare-metal Ethernet köprüsü: src/ (taşınabilir), mss/ (Microchip HAL portu),
           sim/ (Linux/TAP derlemesi, test_udp.sh, tüm döngü ortak simülasyonu cosim.sh)
 libero/   create_project.tcl (Libero SoC projesi + sentez), h264_dec.sdc, h264_hdmi.sdc,

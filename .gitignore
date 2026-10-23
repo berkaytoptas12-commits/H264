@@ -8,3 +8,8 @@ streams/
 *.cf
 __pycache__/
 *.rgb
+
+# PyInstaller (host/build_exe.bat, scripts/build_exe_wine.sh)
+/host/build/
+/host/dist/
+/host/*.spec
