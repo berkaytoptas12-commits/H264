@@ -11,6 +11,8 @@ tamamen FPGA dokusunda (fabric) çalışmak üzere yazılmış bir **H.264 / AVC
   (aşağıdaki doğrulama tablosuna bakın).
 * PC'den video gönderme: **Ethernet** (bölüm 9; MSS'teki küçük bir bare-metal program yalnızca ağ
   paketlerini fabric'e taşır, çözme yine fabric'tedir). İsteğe bağlı seri hat alternatifi bölüm 8'dedir.
+* Görüntü çıkışı: **HDMI** (bölüm 10; DDR'daki kareler fabric'te okunur, RGB'ye çevrilir, TMDS olarak
+  transceiver hatlarından 1080p60 basılır).
 
 ## 1. Desteklenen özellikler
 
@@ -277,10 +279,10 @@ periyodu 13.333 ns'ye (75 MHz) çekin, 1080p30 yine karşılanır. Gerekli saat 
    Videoyu PC'den seri bağlantıyla göndermek için `h264_dec_top` yerine `h264_dec_uart_top` kullanın
    (bölüm 8; Libero betiğinde `SCRIPT_ARGS:"./h264_dec_prj h264_dec_uart_top"`), Ethernet üzerinden
    göndermek için `h264_dec_mss_top` (bölüm 9).
-5. Ekran: `o_frame_valid/index` ile gelen tamponu, kitin HDMI yolunu besleyen bir çerçeve okuyucu
-   (YUV420 → YUV422/RGB dönüşümü ile) okur; okuma bitince `i_release` ile geri verir. Çıkış çerçeve
-   hızını ayarlamak (ör. 30 fps) tüketicinin görevidir; tüketici tamponu tutarken çözücü o tamponu
-   kullanmaz, en fazla 18 tampon döngüdedir.
+5. Ekran: `h264_dec_hdmi_top` bu işi yapar (`h264_disp`, bölüm 10): `o_frame_valid/index` ile gelen
+   tamponu DDR'dan okur, RGB'ye çevirip HDMI'ya basar ve okuma bitince `i_release` ile geri verir.
+   Kendi ekran okuyucunuzu bağlarsanız: tüketici tamponu tutarken çözücü o tamponu kullanmaz, en
+   fazla 18 tampon döngüdedir; çıkış kare hızını ayarlamak tüketicinin görevidir.
 6. `o_error`, `o_stream_done` ve `o_pic_count` bir LED'e / SmartDebug'a / Identify'a bağlanabilir.
 
 ### 7.3 Açık kaynak tahmini (Libero olmadan)
@@ -542,23 +544,146 @@ Kitte çalıştırmak için: 9.1–9.3'teki adres/saat/PHY ayarları doğrulanma
 sınırı Python modelidir; kitte her 1 KB'lık çerçeve için bir kopya (alma kesmesi) ve 256 APB yazması
 yapılır, bu da çözücünün ihtiyacının (1080p 8 Mbit/s ≈ 1 MB/s) çok üstünde olmalıdır (tahmin).
 
-## 10. Dizin yapısı
+## 10. HDMI çıkışı (fabric, transceiver üzerinden)
+
+```
+ DDR4 (çerçeve deposu)                         fabric                                         kit
+   │ AXI4 okuma (ARID 1)        ┌──────────────────────────────────────────────┐
+   └──► h264_axi_rd_arb ◄──────►│ h264_disp_rd   kare kuyruğu, kare hızı,      │  4 satır yuvası
+        (çözücü ARID 0 ile      │ (100 MHz)      satır okuma (Y, Cb, Cr)       │──► (iki saatli LSRAM)
+         aynı okuma portu)      └──────────────────────────────────────────────┘        │
+                                ┌──────────────────────────────────────────────┐        ▼
+                                │ h264_disp_px  1080p60 zamanlama, YCbCr→RGB,  │  PF_XCVR (PMA, 4 hat × 40 bit,
+                                │ (37.125 MHz,  renk çubukları, TMDS × 3       │──► 1485 Mbit/s) ──► PI3HDX1204
+                                │  saatte 4 px) + TMDS saat hattı              │     re-driver ──► HDMI TX
+                                └──────────────────────────────────────────────┘
+```
+
+`h264_dec_hdmi_top` = `h264_dec_mss_top` (Ethernet bağlantısı + çözücü) + `h264_axi_rd_arb` +
+`h264_disp`. Kitte HDMI TX, SerDes 2 hatlarından bir re-driver (PI3HDX1204) üzerinden konnektöre
+gider; referans saati 148.5 MHz'lik bir osilatördür (Video Kit kullanım kılavuzu). Bu yüzden görüntü
+fabric'te TMDS sembollerine çevrilip transceiver'a (PF_XCVR, PMA modu) 40 bitlik sözcükler olarak
+verilir; hat başına hız piksel saatinin 10 katıdır.
+
+**DVI sinyali:** Sinyal DVI 1.0 TMDS kodlamasıdır (RGB, 8 bit, tam aralık). HDMI ekranlar DVI
+sinyalini kabul eder; lisanslı HDMI TX çekirdeği gerekmez, ses ve InfoFrame yoktur. Hat düzeni
+Microchip'in PolarFire HDMI 2.0 referans bileşeniyle aynıdır: LANE0 = TMDS saati (`0000011111`),
+LANE1 = mavi (HSYNC/VSYNC), LANE2 = yeşil, LANE3 = kırmızı; piksel tarafı LANE0'ın TX saatiyle
+(37.125 MHz = 148.5 MHz / 4) çalışır.
+
+**Davranış**
+* Resim ekranın ortasına konur (yatay başlangıç 16'nın katına yuvarlanır); ekrandan büyükse
+  ortadan kırpılır. Ölçekleme yoktur (1080p ekranda 720p video ortada, çerçeveli görünür).
+* Renk dönüşümü: 720 satır ve üstü BT.709, altı BT.601 (sınırlı aralık YCbCr → tam aralık RGB,
+  10 bit sabit noktalı katsayılar); kroma en yakın örnekle çoğaltılır.
+* İlk kare gelene kadar, ekran kapalıyken ya da istenince %75 renk çubukları gösterilir. HDMI
+  bağlantısını videodan bağımsız denemek için bunu kullanın (GUI: "renk çubukları",
+  `h264_send.py --bars`).
+* Kare hızı: Ekran 60 Hz'dir. Her ekran karesinde videonun kare hızına göre (ör. 25 fps'te 60
+  karede 25 kez) bir sonraki kareye geçilir. Kare hızını GUI ve `h264_send.py` dosyadan bulup
+  (ham akışta SPS VUI, kapsayıcıda ffprobe; yoksa 30) gönderimden önce kite yazar.
+* Ekran kareleri tuttuğu için çözücü oynatma hızında çalışır. FIFO dolunca PC'nin gönderimi de
+  kredi beklemesiyle yavaşlar; dosya gerçek zamanlı oynatılır. HDMI saati yoksa (transceiver
+  hazır değil) kareler hemen geri verilir, çözme durmaz.
+* "Akış bitti" bayrağı ekran bekleyen son kareyi de aldıktan sonra kalkar. PC yeni bir video
+  başlattığında (START → çözücü sıfırlanır) ekran eski kareleri geri vermeden unutur; o ekran
+  karesinin kalanı renk çubuğu olur, yeni video ilk karesiyle başlar.
+* Ekran okuyucunun yükü: 1080p60'ta satır başına 3840 bayt, yaklaşık 280 MB/s; DDR4 için
+  sorun değildir.
+
+**Yazmaçlar** (APB penceresi, bölüm 9.1; kit yazılımı `H264R` komutuyla yazar):
+
+| Ofset | Yazmaç | Anlamı |
+|---|---|---|
+| 0x2C | DISP_CTRL | [0] ekran kapalı (kareler hemen geri verilir), [1] renk çubukları, [2] TMDS sözcüklerinin bit sırası ters, [31:16] videonun kare hızı × 100 (varsayılan 3000) |
+| 0x30 | DISP_STAT | [15:0] kare geçişi sayısı, [31:16] verisi zamanında gelmediği için siyah gösterilen satır sayısı |
+
+**Kaynak (yosys tahmini):**
+* Okuyucu (`h264_disp_rd`, 100 MHz): ~1600 LUT, ~1650 FF, en uzun yol 11.7 seviye; çözücü
+  modüllerinin altında.
+* Piksel tarafı (`h264_disp_px`, 37.125 MHz, üç TMDS kodlayıcı dahil): ~2550 LUT, ~1250 FF,
+  56 MACC. En uzun yol 21.5 seviye; bu, dört sembol boyunca zincirlenen TMDS DC dengesidir ve
+  26.9 ns'lik saat periyoduna sığar.
+* Hakem: ~50 LUT.
+* Satır yuvaları: Y 1024×64 + Cb/Cr 2×512×64 bit (~8 LSRAM).
+
+### 10.1 Libero entegrasyonu
+
+1. Projeye `rtl/*.vhd`'yi ekleyin (`create_project.tcl` ile kök `h264_dec_hdmi_top`;
+   `libero/h264_hdmi.sdc` otomatik eklenir).
+2. `source libero/hdmi_phy.tcl` ile transceiver bileşenlerini ve `HDMI_PHY` SmartDesign'ını
+   oluşturun: PF_XCVR_REF_CLK (diferansiyel, 148.5 MHz), PF_TX_PLL, PF_XCVR_ERM (PMA modu, 4 hat,
+   TX arayüzü 40 bit, 1485 Mbit/s). **Bu betik Libero'da çalıştırılmadı.** Parametre adları
+   Microchip'in HDMI 2.0 örneğinden alındı. Çalıştırdıktan sonra PF_XCVR yapılandırıcısında TX hızının
+   1485 Mbit/s, TX saatinin 37.125 MHz olduğunu ve TX PLL'in istenen frekansta olduğunu kontrol edin.
+3. SmartDesign bağlantıları:
+
+   | h264_dec_hdmi_top | HDMI_PHY |
+   |---|---|
+   | `o_tmds_clk` / `o_tmds_b` / `o_tmds_g` / `o_tmds_r` | `LANE0_TX_DATA` / `LANE1_TX_DATA` / `LANE2_TX_DATA` / `LANE3_TX_DATA` |
+   | `hdmi_clk`, `hdmi_clk_stable` | `TX_CLK`, `TX_CLK_STABLE` |
+   | `m_axi_*` | PF_DDR4 AXI portu (genişlik farklıysa CoreAXI4Interconnect) |
+   | `paddr` … `pslverr` | MSS FIC3 APB (bölüm 9.1) |
+
+4. I/O Editor'da PF_XCVR'ı HDMI TX re-driver'ına giden SerDes 2 hatlarına, referans saatini
+   148.5 MHz osilatörün pinlerine yerleştirin (kılavuzda AF29/AF30). **Kitin şemasından
+   doğrulayın:** hangi hattın TMDS saati/D0/D1/D2 olduğu (farklıysa SmartDesign'da 40 bitlik
+   veri yollarının bağlantısını değiştirin), P/N yönü ve re-driver'ın etkinleştirme pini.
+5. Başka bir mod için generic'leri değiştirin. Yatay toplam 4'ün katı olmalıdır. 720p60'ın CEA
+   toplamı 1650'dir ve 4'e bölünmez; `G_H_FP => 108` ile 1648 kullanın (60.07 Hz, ekranlar kabul eder).
+   Hat hızı 742.5 Mbit/s'dir.
+
+**Çalıştırma sırası önerisi:**
+1. Bitstream'i yükleyin; video göndermeden ekranda renk çubukları görünmelidir.
+2. Görüntü yoksa transceiver'ın bit sırasını deneyin: `h264_send.py --bars --bitrev` ya da GUI'de
+   "TMDS bit sırası ters".
+3. Sonra videoyu gönderin. `h264_send.py --info` çıktısındaki `disp_frames` ve `disp_late_lines`
+   değerleri ekranın durumunu gösterir.
+
+### 10.2 Doğrulama
+
+`scripts/run_sim.sh disp <akış_dizini> <ad>` (`tb/tb_disp.vhd`) şu zinciri çalıştırır: akış →
+çözücü → DDR modeli (rastgele geri basınç, okuma gecikmesi) → hakem → `h264_disp` → TMDS.
+Testbench TMDS sembollerini geri çözer:
+* Saat hattı deseni, her sembolün geçerliliği ve DC dengesi denetlenir.
+* Satır/kare uzunlukları ve sync genişlikleri denetlenir.
+* Tam kareler dosyaya yazılır; `scripts/disp_check.py` bunları ffmpeg referansından aynı kurallarla
+  üretilen beklenen RGB görüntüyle bit bit karşılaştırır.
+
+Simülasyon küçük bir ekran zamanlamasıyla yapılır (varsayılan 256x192, `DISP=WxH`).
+
+| Test | Sonuç |
+|---|---|
+| qcif_ip (176x144, ortada) | 2 renk çubuğu karesinden sonra 8 karenin her biri sırayla bir kez gösterildi, RGB birebir; 0 TMDS hatası |
+| qcif_ip, ekran 160x128 (ortadan kırpma) | 8 kare birebir |
+| odd_100x60 (kırpmalı akış) | 6 kare birebir |
+| qcif_ip, 30 fps (`RATE=3000`) | her kare iki ekran karesi boyunca gösterildi |
+| hd720 (BT.709, ekran 256x192'ye ortadan kırpılmış) | ilk kare BT.709 dönüşümüyle birebir (720p'nin simülasyonda çözümü çok yavaş olduğu için kare tekrarlanarak gösterildi) |
+| qcif_ip, `RESTART=1`: akış bitince çözücü sıfırlanır, akış yeniden gönderilir (PC'den yeni video) | ilk turda 8 kare, kısa renk çubuğu geçişi, ikinci turda yine 8 kare birebir; çözücü hatası yok |
+| Kit yazılımı / PC (`kit/sim`) | `--bars`, VUI'den okunan 25 fps `DISP_CTRL`'e yazıldı |
+
+Her çalıştırmada sıfırlamadan sonraki ilk satır siyah sayılır (`late lines = 1`); okuyucunun ilk
+satırı hazırlamasından önce gelir ve beklenen bir durumdur.
+
+## 11. Dizin yapısı
 
 ```
 model/    C referans modeli (h264_model.c)
 rtl/      VHDL-2008 RTL (çözücü; h264_uart / h264_link / h264_dec_uart_top: seri bağlantı;
-          h264_apb_bridge / h264_dec_mss_top: MSS üzerinden Ethernet)
-tb/       GHDL testbench'leri (tb_parse, tb_top, tb_link, tb_apb, tb_util_pkg)
+          h264_apb_bridge / h264_dec_mss_top: MSS üzerinden Ethernet; h264_disp / h264_tmds /
+          h264_axi_rd_arb / h264_dec_hdmi_top: HDMI çıkışı)
+tb/       GHDL testbench'leri (tb_parse, tb_top, tb_link, tb_apb, tb_disp, tb_util_pkg)
 scripts/  gen_streams.sh, stream_tools.py, gen_tables.py, run_sim.sh, yuvcmp.py,
-          synth_estimate.sh, pf_depth.py
+          synth_estimate.sh, pf_depth.py, disp_check.py
 host/     PC programları: h264_send.py (komut satırı), h264_gui.py (arayüz), h264link.py (protokol,
           seri ve UDP), fpga_emu.py (FPGA tarafının yazılım modeli), test_link.py, make_vectors.py
 kit/      MSS bare-metal Ethernet köprüsü: src/ (taşınabilir), mss/ (Microchip HAL portu),
           sim/ (Linux/TAP derlemesi)
-libero/   create_project.tcl (Libero SoC projesi + sentez), h264_dec.sdc, uart_pins.pdc (şablon)
+libero/   create_project.tcl (Libero SoC projesi + sentez), h264_dec.sdc, h264_hdmi.sdc,
+          hdmi_phy.tcl (HDMI transceiver bileşenleri), uart_pins.pdc (şablon)
 ```
 
-## 11. Bilinen sınırlar / yol haritası
+## 12. Bilinen sınırlar / yol haritası
 
 * Main/High profil (CABAC, B slice, 8x8 dönüşüm) desteklenmiyor.
 * Çıkış sırası çözme sırasıdır; B slice olmayan akışlarda bu, gösterim sırasıyla aynıdır.
@@ -569,5 +694,8 @@ libero/   create_project.tcl (Libero SoC projesi + sentez), h264_dec.sdc, uart_p
   PHY reset'i ve FIC3 adresi/saati kart üzerinde doğrulanmalıdır. FIC3 APB'si çözücüyle aynı saatte
   olmalıdır (saat alanı geçişi yok). Kit konsolu Ethernet üzerindendir; ağ hiç kurulamıyorsa ilk
   kurulumda UART kopyası ya da hata ayıklayıcı gerekebilir.
+* HDMI çıkışı simülasyonda doğrulandı, kitte çalıştırılmadı. Transceiver ayarları (`hdmi_phy.tcl`),
+  hat sırası/yönü ve re-driver ayarı kart üzerinde doğrulanmalıdır. Çıkış DVI sinyalidir (ses ve
+  InfoFrame yok); ölçekleme yoktur, kroma en yakın örnekle çoğaltılır.
 * Olası iyileştirmeler: deblock'ta MB yüklemesini önceki MB'nin çıkışıyla örtüştürmek, CAVLC'de
   level + run_before'u tek adımda çözmek, tahmin tamponunu LSRAM'e taşımak.

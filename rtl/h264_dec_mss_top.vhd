@@ -90,7 +90,12 @@ entity h264_dec_mss_top is
         -- status
         o_error         : out std_logic;     -- unsupported or corrupt stream (sticky)
         o_stream_done   : out std_logic;     -- end of stream reached, all frames delivered
-        o_pic_count     : out std_logic_vector(31 downto 0)
+        o_pic_count     : out std_logic_vector(31 downto 0);
+        -- display registers in the APB window (see h264_apb_bridge / h264_disp)
+        o_disp_ctrl     : out std_logic_vector(31 downto 0);
+        i_disp_status   : in  std_logic_vector(31 downto 0) := (others => '0');
+        o_dec_rst       : out std_logic;         -- decoder in reset (START / CTRL): frames forgotten
+        i_disp_busy     : in  std_logic := '0'   -- display still has frames to show: hold "stream done"
     );
 end entity;
 
@@ -102,7 +107,7 @@ architecture rtl of h264_dec_mss_top is
     signal dec_rst, soft_rst, link_rst, dec_rst_any : std_logic;
     signal frame_ok, frame_bad : std_logic;
     signal pic_cnt  : std_logic_vector(31 downto 0);
-    signal dec_err, dec_done : std_logic;
+    signal dec_err, dec_done, dec_done_raw : std_logic;
     signal width_s, height_s : std_logic_vector(11 downto 0);
     signal rx_stretch, bad_stretch : unsigned(22 downto 0);
 begin
@@ -113,9 +118,13 @@ begin
                   o_rx_data => rx_data, o_rx_valid => rx_valid,
                   i_tx_data => tx_data, i_tx_valid => tx_valid, o_tx_ready => tx_ready,
                   i_pic_count => pic_cnt, i_error => dec_err, i_stream_done => dec_done,
-                  i_width => width_s, i_height => height_s, o_soft_rst => soft_rst);
+                  i_width => width_s, i_height => height_s, o_soft_rst => soft_rst,
+                  o_disp_ctrl => o_disp_ctrl, i_disp_status => i_disp_status);
 
     link_rst <= rst or soft_rst;
+    -- "stream done" for the PC once the display has taken every frame
+    dec_done <= dec_done_raw and not i_disp_busy;
+    o_dec_rst <= dec_rst_any;
 
     u_link : entity work.h264_link
         generic map (G_FIFO_AW => G_FIFO_AW)
@@ -191,7 +200,7 @@ begin
             o_crop_top => o_crop_top,
             o_crop_bottom => o_crop_bottom,
             o_error => dec_err,
-            o_stream_done => dec_done,
+            o_stream_done => dec_done_raw,
             o_pic_count => pic_cnt
         );
 

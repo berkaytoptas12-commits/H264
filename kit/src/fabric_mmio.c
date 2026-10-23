@@ -74,6 +74,21 @@ uint32_t fabric_read(uint8_t *p, uint32_t max)
     return n;
 }
 
+void fabric_display_set(uint32_t ctrl)
+{
+    REG(FR_DISP_CTRL) = ctrl;
+}
+
+uint32_t fabric_display_ctrl(void)
+{
+    return REG(FR_DISP_CTRL);
+}
+
+uint32_t fabric_display_status(void)
+{
+    return REG(FR_DISP_STAT);
+}
+
 void fabric_status(fabric_status_t *st)
 {
     uint32_t s = REG(FR_STATUS);

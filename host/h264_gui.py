@@ -79,8 +79,22 @@ class App:
         self.bitrate.insert(0, "otomatik")
         self.bitrate.grid(row=0, column=4)
 
+        disp = ttk.LabelFrame(f, text="Ekran (HDMI)", padding=6)
+        disp.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        ttk.Label(disp, text="Kare hızı (fps)").grid(row=0, column=0)
+        self.fps = ttk.Entry(disp, width=9)
+        self.fps.insert(0, "otomatik")
+        self.fps.grid(row=0, column=1, padx=(4, 12))
+        self.bars = tk.BooleanVar(value=False)
+        ttk.Checkbutton(disp, text="renk çubukları (HDMI testi)", variable=self.bars,
+                        command=self.apply_display).grid(row=0, column=2, sticky="w")
+        self.bitrev = tk.BooleanVar(value=False)
+        ttk.Checkbutton(disp, text="TMDS bit sırası ters", variable=self.bitrev,
+                        command=self.apply_display).grid(row=0, column=3, sticky="w", padx=(12, 0))
+        ttk.Button(disp, text="Uygula", command=self.apply_display).grid(row=0, column=4, padx=(12, 0))
+
         b = ttk.Frame(f)
-        b.grid(row=3, column=0, columnspan=3, sticky="ew")
+        b.grid(row=4, column=0, columnspan=3, sticky="ew")
         self.btn_send = ttk.Button(b, text="Gönder", command=self.send)
         self.btn_send.pack(side="left")
         self.btn_stop = ttk.Button(b, text="Durdur", command=self.stop, state="disabled")
@@ -88,15 +102,15 @@ class App:
         ttk.Button(b, text="Durum", command=self.status).pack(side="left")
 
         self.prog = ttk.Progressbar(f, mode="determinate", maximum=1000)
-        self.prog.grid(row=4, column=0, columnspan=3, sticky="ew", pady=6)
+        self.prog.grid(row=5, column=0, columnspan=3, sticky="ew", pady=6)
         self.info = tk.StringVar(value="hazır")
-        ttk.Label(f, textvariable=self.info).grid(row=5, column=0, columnspan=3, sticky="w")
+        ttk.Label(f, textvariable=self.info).grid(row=6, column=0, columnspan=3, sticky="w")
         self.dec = tk.StringVar(value="çözücü: -")
-        ttk.Label(f, textvariable=self.dec).grid(row=6, column=0, columnspan=3, sticky="w")
+        ttk.Label(f, textvariable=self.dec).grid(row=7, column=0, columnspan=3, sticky="w")
 
         nb = ttk.Notebook(f)
-        nb.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
-        f.rowconfigure(7, weight=1)
+        nb.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
+        f.rowconfigure(8, weight=1)
         tab_log = ttk.Frame(nb)
         tab_con = ttk.Frame(nb)
         nb.add(tab_log, text="Günlük")
@@ -175,14 +189,23 @@ class App:
         port = int(self.udp_port.get())
         if not ip or not 0 < port < 65536:
             raise ValueError
-        return dict(ip=ip, port=port, force=self.force.get(),
-                    size=self.size.get(), bitrate=self.bitrate.get().strip())
+        fps = self.fps.get().strip().replace(",", ".")
+        if fps not in ("", "otomatik"):
+            fps = float(fps)
+            if not 1 <= fps <= 60:
+                raise ValueError
+        else:
+            fps = None
+        return dict(ip=ip, port=port, force=self.force.get(), size=self.size.get(),
+                    bitrate=self.bitrate.get().strip(), fps=fps, bars=self.bars.get(),
+                    bitrev=self.bitrev.get())
 
     def checked_settings(self):
         try:
             return self.settings()
         except ValueError:
-            messagebox.showerror("Hata", "Kit IP adresini ve UDP portunu (1-65535) girin")
+            messagebox.showerror("Hata", "Kit IP adresini, UDP portunu (1-65535) ve kare hızını "
+                                 "(1-60 ya da otomatik) kontrol edin")
             return None
 
     def open_sender(self, cfg):
@@ -204,6 +227,33 @@ class App:
         if isinstance(e, OSError):
             return "Ağa ulaşılamıyor (%s). PC'nin Ethernet bağlantısını ve adresini kontrol edin." % e
         return str(e)
+
+    # -- HDMI display --------------------------------------------------------
+    def set_display(self, cfg, fps):
+        """send frame rate / colour bars to the kit (worker thread); True on success"""
+        try:
+            c = hl.KitConsole(cfg["ip"], cfg["port"] + 1)
+            try:
+                r = c.set_display(fps, (2 if cfg["bars"] else 0) | (4 if cfg["bitrev"] else 0))
+            finally:
+                c.close()
+        except OSError:
+            r = None
+        if r is None or r == 0xFFFFFFFF:
+            self.say("ekran ayarı gönderilemedi (kit yazılımı ya da fabric yanıt vermedi)", "warn")
+            return False
+        self.say("ekran: %.2f fps%s" % ((r >> 16) / 100.0, ", renk çubukları" if r & 2 else ""))
+        return True
+
+    def apply_display(self):
+        if self.busy():
+            return
+        cfg = self.checked_settings()
+        if not cfg:
+            return
+        fps = cfg["fps"] or 30.0
+        self.worker = threading.Thread(target=self.set_display, args=(cfg, fps), daemon=True)
+        self.worker.start()
 
     # -- kit console (over Ethernet) -----------------------------------------
     def console_tick(self):
@@ -438,6 +488,8 @@ class App:
                 chunks = hl.read_chunks(path)
                 total = os.path.getsize(path)
                 self.say("dosya olduğu gibi gönderiliyor (%d bayt)" % total)
+            fps = cfg["fps"] or hl.video_fps(path) or 30.0
+            self.set_display(cfg, fps)
             self.sender = s = self.open_sender(cfg)
             try:
                 r = s.start()

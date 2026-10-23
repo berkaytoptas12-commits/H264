@@ -2,6 +2,7 @@
 -- h264_ram.vhd
 -- Generic memories used between the pipeline stages.
 --   h264_ram_sdp  : simple dual port RAM, synchronous read (LSRAM / uSRAM)
+--   h264_ram_dc   : the same with separate write and read clocks (LSRAM)
 --   h264_coefbuf  : coefficient buffer (4 row lanes, one 4x4 block per address)
 --   h264_predbuf  : inter prediction buffer (registers, row write, block read)
 -- ============================================================================
@@ -34,6 +35,51 @@ begin
             if we = '1' then
                 mem(to_integer(waddr)) <= wdata;
             end if;
+            rdata <= mem(to_integer(raddr));
+        end if;
+    end process;
+end architecture;
+
+-- ----------------------------------------------------------------------------
+-- h264_ram_dc: simple dual port RAM, write port on wclk, registered read port
+-- on rclk (display line buffers between the AXI and the pixel clock).
+-- ----------------------------------------------------------------------------
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity h264_ram_dc is
+    generic (
+        G_AW : natural := 9;
+        G_DW : natural := 64
+    );
+    port (
+        wclk  : in  std_logic;
+        we    : in  std_logic;
+        waddr : in  unsigned(G_AW - 1 downto 0);
+        wdata : in  std_logic_vector(G_DW - 1 downto 0);
+        rclk  : in  std_logic;
+        raddr : in  unsigned(G_AW - 1 downto 0);
+        rdata : out std_logic_vector(G_DW - 1 downto 0)
+    );
+end entity;
+
+architecture rtl of h264_ram_dc is
+    type mem_t is array (0 to 2 ** G_AW - 1) of std_logic_vector(G_DW - 1 downto 0);
+    signal mem : mem_t;
+begin
+    process (wclk)
+    begin
+        if rising_edge(wclk) then
+            if we = '1' then
+                mem(to_integer(waddr)) <= wdata;
+            end if;
+        end if;
+    end process;
+
+    process (rclk)
+    begin
+        if rising_edge(rclk) then
             rdata <= mem(to_integer(raddr));
         end if;
     end process;

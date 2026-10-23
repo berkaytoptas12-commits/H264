@@ -22,7 +22,7 @@ YOSYS=${YOSYS:-yosys}
 mkdir -p "$OUT"
 cd "$OUT" || exit 1
 
-RTL="h264_pkg h264_tables_pkg h264_ram h264_nal h264_bitreader h264_hdr h264_mbparse h264_mc h264_recon h264_deblock h264_dec_top h264_uart h264_link h264_dec_uart_top h264_apb_bridge h264_dec_mss_top"
+RTL="h264_pkg h264_tables_pkg h264_ram h264_nal h264_bitreader h264_hdr h264_mbparse h264_mc h264_recon h264_deblock h264_dec_top h264_uart h264_link h264_dec_uart_top h264_apb_bridge h264_dec_mss_top h264_tmds h264_axi_rd_arb h264_disp h264_dec_hdmi_top"
 rm -f work-obj08.cf
 for f in $RTL; do ghdl -a --std=08 -frelaxed "$ROOT/rtl/$f.vhd" || exit 1; done
 

@@ -16,6 +16,7 @@ datagram, rtl/h264_dec_mss_top.vhd) or a serial port (optional UART link,
 rtl/h264_dec_uart_top.vhd; also used by the tests).
 """
 import binascii
+import os
 import collections
 import select
 import shutil
@@ -388,6 +389,15 @@ class KitConsole:
                 out[k] = v
         return out
 
+    def set_display(self, fps, flags=0, timeout=0.3, tries=3):
+        """HDMI display: stream frame rate (fps) and DISP_CTRL flags (1 off, 2 colour bars,
+        4 bit reversed lanes); returns the control word read back, None without an answer"""
+        ctrl = (min(max(int(round(fps * 100)), 1), 6000) << 16) | (flags & 0xFFFF)
+        d = self._ask(b"H264R" + struct.pack("<I", ctrl), b"r", timeout, tries)
+        if d is None or len(d) < 4:
+            return None
+        return struct.unpack("<I", d[:4])[0]
+
     def read(self, timeout=0.3, tries=1):
         """new console text since the last call as (text, note), None without an answer;
         note: None, "lost" (older text overwritten in the kit) or "restart" (kit rebooted)"""
@@ -482,6 +492,136 @@ def sps_profile(path):
         if data[i + 3] & 0x1F == 7:
             return data[i + 4], data[i + 5]
         i += 3
+
+
+class _Bits:
+    def __init__(self, data):
+        self.d, self.p = data, 0
+
+    def u(self, n):
+        v = 0
+        for _ in range(n):
+            v = (v << 1) | ((self.d[self.p >> 3] >> (7 - (self.p & 7))) & 1)
+            self.p += 1
+        return v
+
+    def ue(self):
+        z = 0
+        while self.u(1) == 0:
+            z += 1
+        return (1 << z) - 1 + self.u(z)
+
+    def se(self):
+        v = self.ue()
+        return (v + 1) // 2 if v & 1 else -(v // 2)
+
+
+def sps_fps(path):
+    """frame rate from the VUI timing info of the first SPS of an Annex-B file
+    (time_scale / (2 * num_units_in_tick)), None if absent"""
+    with open(path, "rb") as f:
+        data = f.read(1 << 20)
+    i = 0
+    while True:
+        i = data.find(b"\x00\x00\x01", i)
+        if i < 0 or i + 4 >= len(data):
+            return None
+        if data[i + 3] & 0x1F == 7:
+            break
+        i += 3
+    j = data.find(b"\x00\x00\x01", i + 3)
+    raw = data[i + 4:j if j > 0 else len(data)]
+    rbsp = bytearray()
+    zeros = 0
+    for c in raw:                      # remove emulation prevention bytes
+        if zeros >= 2 and c == 3:
+            zeros = 0
+            continue
+        rbsp.append(c)
+        zeros = zeros + 1 if c == 0 else 0
+    try:
+        b = _Bits(bytes(rbsp) + b"\x00" * 8)
+        prof = b.u(8)
+        b.u(16)
+        b.ue()
+        if prof in (100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135):
+            cf = b.ue()
+            if cf == 3:
+                b.u(1)
+            b.ue(), b.ue(), b.u(1)
+            if b.u(1):
+                for k in range(8 if cf != 3 else 12):
+                    if b.u(1):
+                        last = nxt = 8
+                        for _ in range(16 if k < 6 else 64):
+                            if nxt:
+                                nxt = (last + b.se() + 256) % 256
+                            last = nxt or last
+        b.ue()
+        poc = b.ue()
+        if poc == 0:
+            b.ue()
+        elif poc == 1:
+            b.u(1), b.se(), b.se()
+            for _ in range(b.ue()):
+                b.se()
+        b.ue(), b.u(1), b.ue(), b.ue()
+        if not b.u(1):
+            b.u(1)
+        b.u(1)
+        if b.u(1):
+            b.ue(), b.ue(), b.ue(), b.ue()
+        if not b.u(1):
+            return None
+        if b.u(1) and b.u(8) == 255:
+            b.u(32)
+        if b.u(1):
+            b.u(1)
+        if b.u(1):
+            b.u(4)
+            if b.u(1):
+                b.u(24)
+        if b.u(1):
+            b.ue(), b.ue()
+        if not b.u(1):
+            return None
+        tick, scale = b.u(32), b.u(32)
+        if tick == 0 or scale == 0:
+            return None
+        return scale / (2.0 * tick)
+    except IndexError:
+        return None
+
+
+def video_fps(path):
+    """frame rate of a video file: VUI timing of a raw H.264 stream, else ffprobe
+    (None if unknown)"""
+    if path == "-":
+        return None
+    if os.path.splitext(path)[1].lower() in (".264", ".h264", ".avc", ".bin"):
+        f = sps_fps(path)
+        if f and 1 <= f <= 240:
+            return f
+    exe = shutil.which("ffprobe")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                              "stream=avg_frame_rate,r_frame_rate", "-of", "default=nw=1", path],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.decode()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    vals = dict(l.split("=", 1) for l in out.split() if "=" in l)
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        num, _, den = vals.get(key, "").partition("/")
+        try:
+            f = float(num) / float(den or 1)
+        except (ValueError, ZeroDivisionError):
+            continue
+        if 1 <= f <= 240:
+            return f
+    return None
 
 
 def ffmpeg_cmd(src, size=None, bitrate=None, fps=None, out="-"):

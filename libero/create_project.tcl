@@ -2,8 +2,9 @@
 # Libero SoC: stand-alone project for the H.264 decoder core
 #
 #   libero SCRIPT:create_project.tcl SCRIPT_ARGS:"<project_dir> [root]"
-#   root: h264_dec_top (default), h264_dec_uart_top (decoder + PC link over UART)
-#         or h264_dec_mss_top (decoder + PC link through the MSS, FIC3 APB)
+#   root: h264_dec_top (default), h264_dec_uart_top (decoder + PC link over UART),
+#         h264_dec_mss_top (decoder + PC link through the MSS, FIC3 APB) or
+#         h264_dec_hdmi_top (h264_dec_mss_top + HDMI display, see hdmi_phy.tcl)
 #
 # Creates a PolarFire SoC MPFS250TS project, imports the VHDL-2008 sources,
 # sets h264_dec_top as root, attaches h264_dec.sdc (100 MHz) and runs
@@ -34,7 +35,7 @@ new_project -location $proj_dir -name {h264_dec} -project_description {H.264 dec
 # VHDL-2008 is required (process(all), external names are only used in the testbench)
 project_settings -vhdl_mode {VHDL_2008}
 
-# root: h264_dec_top (AXI-Stream input), h264_dec_uart_top or h264_dec_mss_top
+# root: h264_dec_top (AXI-Stream input), h264_dec_uart_top, h264_dec_mss_top or h264_dec_hdmi_top
 set root "h264_dec_top"
 if {[llength $argv] > 1} { set root [lindex $argv 1] }
 
@@ -42,6 +43,7 @@ set files {
     h264_pkg.vhd h264_tables_pkg.vhd h264_ram.vhd h264_nal.vhd h264_bitreader.vhd
     h264_hdr.vhd h264_mbparse.vhd h264_mc.vhd h264_recon.vhd h264_deblock.vhd h264_dec_top.vhd
     h264_uart.vhd h264_link.vhd h264_dec_uart_top.vhd h264_apb_bridge.vhd h264_dec_mss_top.vhd
+    h264_tmds.vhd h264_axi_rd_arb.vhd h264_disp.vhd h264_dec_hdmi_top.vhd
 }
 foreach f $files {
     import_files -convert_EDN_to_HDL 0 -library {work} -hdl_source [file join $src_dir $f]
@@ -50,13 +52,16 @@ import_files -sdc [file normalize [file join [file dirname [info script]] h264_d
 
 build_design_hierarchy
 set_root -module "${root}::work"
-organize_tool_files -tool {SYNTHESIZE} -file [file join $proj_dir constraint h264_dec.sdc] \
-    -module "${root}::work" -input_type {constraint}
-
-organize_tool_files -tool {PLACEROUTE} -file [file join $proj_dir constraint h264_dec.sdc] \
-    -module "${root}::work" -input_type {constraint}
-organize_tool_files -tool {VERIFYTIMING} -file [file join $proj_dir constraint h264_dec.sdc] \
-    -module "${root}::work" -input_type {constraint}
+set sdc_files [list [file join $proj_dir constraint h264_dec.sdc]]
+if {$root eq "h264_dec_hdmi_top"} {
+    import_files -sdc [file normalize [file join [file dirname [info script]] h264_hdmi.sdc]]
+    lappend sdc_files [file join $proj_dir constraint h264_hdmi.sdc]
+}
+set file_args {}
+foreach f $sdc_files { lappend file_args -file $f }
+foreach tool {SYNTHESIZE PLACEROUTE VERIFYTIMING} {
+    organize_tool_files -tool $tool {*}$file_args -module "${root}::work" -input_type {constraint}
+}
 
 run_tool -name {SYNTHESIZE}
 # Stand-alone place & route needs every top level port on a pin (about 420

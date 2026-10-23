@@ -9,10 +9,15 @@
 #   run_sim.sh top-uart <stream_dir> [name ...]  tb_top with the stream sent over the PC link
 #   run_sim.sh apb   <stream_dir> [name ...]   MSS path (tb_apb): link frames written through
 #                                              h264_apb_bridge as the firmware does
+#   run_sim.sh disp  <stream_dir> [name ...]   HDMI display path (tb_disp): decoder -> DDR model
+#                                              -> h264_disp -> TMDS, decoded back and compared
+#                                              with the reference (scripts/disp_check.py)
 #
 # Streams come from gen_streams.sh (<name>.264, <name>.ref.yuv, <name>.info).
 # Without names every stream in <stream_dir> is run.
 # Environment: STALL=0|1 (random AXI back-pressure, default 1), TIMEOUT_US,
+#              DISP=WxH (display size for disp, default 256x192), RATE (fps*100, 6000),
+#              RESTART=1 (disp: decoder reset after the stream, stream sent again),
 #              WORK (GHDL work directory, default ./sim/work),
 #              IEEE_ASSERTS=disable|enable (numeric_std warnings, default disable)
 set -uo pipefail
@@ -29,20 +34,22 @@ GHDL="ghdl"
 # numeric_std warnings come from pipeline registers that are evaluated
 # before they carry valid data; IEEE_ASSERTS=enable shows them
 IEEE_ASSERTS=${IEEE_ASSERTS:-disable}
+DISP=${DISP:-256x192}
 GFLAGS="--std=08 -frelaxed --workdir=$WORK"
 
 MODEL="$WORK/h264_model"
 gcc -O2 -o "$MODEL" "$ROOT/model/h264_model.c" || exit 1
 
-RTL="h264_pkg h264_tables_pkg h264_ram h264_nal h264_bitreader h264_hdr h264_mbparse h264_mc h264_recon h264_deblock h264_dec_top h264_uart h264_link h264_dec_uart_top h264_apb_bridge h264_dec_mss_top"
+RTL="h264_pkg h264_tables_pkg h264_ram h264_nal h264_bitreader h264_hdr h264_mbparse h264_mc h264_recon h264_deblock h264_dec_top h264_uart h264_link h264_dec_uart_top h264_apb_bridge h264_dec_mss_top h264_tmds h264_axi_rd_arb h264_disp h264_dec_hdmi_top"
 for f in $RTL; do $GHDL -a $GFLAGS "$ROOT/rtl/$f.vhd" || exit 1; done
-for f in tb_util_pkg tb_parse tb_top tb_link tb_apb; do $GHDL -a $GFLAGS "$ROOT/tb/$f.vhd" || exit 1; done
+for f in tb_util_pkg tb_parse tb_top tb_link tb_apb tb_disp; do $GHDL -a $GFLAGS "$ROOT/tb/$f.vhd" || exit 1; done
 
 case "$MODE" in
     parse) $GHDL -e $GFLAGS tb_parse || exit 1 ;;
     top|top-uart) $GHDL -e $GFLAGS tb_top || exit 1 ;;
     link) $GHDL -e $GFLAGS tb_link || exit 1 ;;
     apb) $GHDL -e $GFLAGS tb_apb || exit 1 ;;
+    disp) $GHDL -e $GFLAGS tb_disp || exit 1 ;;
 esac
 VEC="python3 $ROOT/host/make_vectors.py"
 
@@ -63,6 +70,24 @@ for n in "${names[@]}"; do
         $GHDL -r $GFLAGS tb_parse --ieee-asserts=$IEEE_ASSERTS -gG_IN="$SDIR/$n.264" -gG_TRACE="$OUT/$n.rtl_trace.txt" \
             -gG_TIMEOUT_US="${TIMEOUT_US:-5000000}" > "$OUT/$n.log" 2>&1
         if cmp -s "$OUT/$n.model_trace.txt" "$OUT/$n.rtl_trace.txt"; then res="OK"; else res="TRACE MISMATCH"; fi
+    elif [ "$MODE" = disp ]; then
+        cw=$(( (w + 15) / 16 * 16 )); ch=$(( (h + 15) / 16 * 16 ))
+        dw=${DISP%x*}; dh=${DISP#*x}
+        runs=()
+        if [ "${RESTART:-0}" = 1 ]; then runs=(--restart)
+        elif [ "${RATE:-6000}" = 6000 ]; then runs=(--runs 1)
+        elif [ "${RATE:-6000}" = 3000 ]; then runs=(--runs 2); fi
+        # after the last frame is handed over: queue (4) + current frame, each shown 6000/RATE times
+        extra=$(( (6000 + ${RATE:-6000} - 1) / ${RATE:-6000} * 5 + 2 ))
+        $GHDL -r $GFLAGS tb_disp --ieee-asserts=$IEEE_ASSERTS -gG_IN="$SDIR/$n.264" -gG_OUT="$OUT/$n.disp.rgb" \
+            -gG_MAXW=$cw -gG_MAXH=$ch -gG_H_ACT=$dw -gG_V_ACT=$dh -gG_RATE="${RATE:-6000}" -gG_EXTRA=$extra -gG_RESTART="${RESTART:-0}" \
+            -gG_STALL="${STALL:-1}" -gG_TIMEOUT_US="${TIMEOUT_US:-400000}" > "$OUT/$n.log" 2>&1
+        if grep -q "0 TMDS errors" "$OUT/$n.log"; then
+            res=$(python3 "$HERE/disp_check.py" "$OUT/$n.disp.rgb" "$SDIR/$n.ref.yuv" "$w" "$h" "$dw" "$dh" "${runs[@]}" | tail -1)
+            res="$res | $(grep -o '[0-9]* TMDS errors.*' "$OUT/$n.log")"
+        else
+            res="FAIL (see $OUT/$n.log)"
+        fi
     elif [ "$MODE" = link ] || [ "$MODE" = apb ]; then
         $VEC "$SDIR/$n.264" "$OUT/$n.frames.txt" > /dev/null
         $GHDL -r $GFLAGS tb_$MODE --ieee-asserts=$IEEE_ASSERTS -gG_IN="$SDIR/$n.264" -gG_FRAMES="$OUT/$n.frames.txt" \

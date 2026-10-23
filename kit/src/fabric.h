@@ -22,6 +22,8 @@
 #define FR_PICTURES     0x20u
 #define FR_SIZE         0x24u
 #define FR_CTRL         0x28u
+#define FR_DISP_CTRL    0x2Cu   /* [0] off, [1] colour bars, [2] bit reversed lanes, [31:16] fps*100 */
+#define FR_DISP_STAT    0x30u   /* [15:0] frame switches, [31:16] lines shown black (late) */
 
 typedef struct {
     uint32_t error;         /* decoder reported an unsupported / broken stream */
@@ -44,5 +46,10 @@ void fabric_status(fabric_status_t *st);
 
 /* Reset link and decoder, flush both FIFOs. */
 void fabric_reset(void);
+
+/* HDMI display (h264_disp): control word (see FR_DISP_CTRL) and status. */
+void fabric_display_set(uint32_t ctrl);
+uint32_t fabric_display_ctrl(void);
+uint32_t fabric_display_status(void);
 
 #endif

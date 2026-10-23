@@ -40,6 +40,21 @@ def human(n):
         n /= 1024.0
 
 
+def display(ip, port, fps, flags):
+    """HDMI display settings through the kit firmware"""
+    try:
+        c = hl.KitConsole(ip, port)
+        r = c.set_display(fps, flags)
+        c.close()
+    except OSError:
+        r = None
+    if r is None or r == 0xFFFFFFFF:
+        print("warning: display settings not accepted (no answer from the kit firmware / fabric)")
+        return 1
+    print("display: %.2f fps%s" % ((r >> 16) / 100.0, ", colour bars" if r & 2 else ""))
+    return 0
+
+
 def kit_console(ip, port, follow):
     try:
         c = hl.KitConsole(ip, port)
@@ -88,7 +103,11 @@ def main():
     ap.add_argument("--raw", action="store_true", help="never convert, send the file as it is")
     ap.add_argument("--size", help="output size when converting, e.g. 1280x720")
     ap.add_argument("--bitrate", help="bit rate when converting, e.g. 1.2M (default: fits the link)")
-    ap.add_argument("--fps", type=float, help="frame rate when converting")
+    ap.add_argument("--fps", type=float, help="frame rate when converting and for the HDMI display "
+                    "(default: from the file, else 30)")
+    ap.add_argument("--bars", action="store_true", help="show colour bars on HDMI (link test) and exit")
+    ap.add_argument("--bitrev", action="store_true", help="HDMI lanes with reversed bit order "
+                    "(try when the monitor shows nothing)")
     ap.add_argument("--no-wait", action="store_true", help="do not wait for the decoder after END")
     uart = ap.add_argument_group("optional UART link instead of Ethernet")
     uart.add_argument("--serial", metavar="PORT", help="serial port (COM5, /dev/ttyUSB0, ...)")
@@ -99,9 +118,11 @@ def main():
     if a.list:
         list_ports()
         return 0
-    if a.info or a.console:
+    if a.info or a.console or a.bars:
         if a.serial:
-            ap.error("--info / --console work over Ethernet only")
+            ap.error("--info / --console / --bars work over Ethernet only")
+        if a.bars:
+            return display(a.ip, a.port + 1, a.fps or 30.0, 2 | (4 if a.bitrev else 0))
         return kit_console(a.ip, a.port + 1, a.console)
     try:
         if a.serial:
@@ -138,6 +159,8 @@ def main():
             chunks = hl.read_chunks(a.input)
             total = os.path.getsize(a.input) if a.input != "-" else None
 
+        if not a.serial:
+            display(a.ip, a.port + 1, a.fps or hl.video_fps(a.input) or 30.0, 4 if a.bitrev else 0)
         r = snd.start()
         print("link up: FIFO %s, decoder reset" % human(r.free + 1))
 

@@ -52,10 +52,14 @@ static uint32_t info(char *t, uint32_t max)
         int m;
 
         fabric_status(&st);
+        uint32_t dc = fabric_display_ctrl(), ds = fabric_display_status();
+
         m = snprintf(t + n, max - (uint32_t)n,
-                     "pictures=%lu\nwidth=%lu\nheight=%lu\ndec_error=%lu\ndec_done=%lu\n",
+                     "pictures=%lu\nwidth=%lu\nheight=%lu\ndec_error=%lu\ndec_done=%lu\n"
+                     "disp_ctrl=0x%08lx\ndisp_fps_x100=%lu\ndisp_frames=%lu\ndisp_late_lines=%lu\n",
                      (unsigned long)st.pictures, (unsigned long)st.width, (unsigned long)st.height,
-                     (unsigned long)st.error, (unsigned long)st.done);
+                     (unsigned long)st.error, (unsigned long)st.done, (unsigned long)dc,
+                     (unsigned long)(dc >> 16), (unsigned long)(ds & 0xFFFFu), (unsigned long)(ds >> 16));
         if (m > 0)
             n += m;
     }
@@ -78,6 +82,17 @@ void service_udp(const net_peer_t *from, const uint8_t *data, uint32_t len)
         put32le(g_out + 9, log_total());
         put32le(g_out + 13, port_ms());
         n += 17u;
+    } else if (data[4] == 'R' && len >= 9u) {
+        g_out[4] = 'r';
+        if (bridge_fabric_ready()) {
+            fabric_display_set(get32le(data + 5));
+            put32le(g_out + 5, fabric_display_ctrl());
+            kit_log("display: %lu.%02lu fps, flags 0x%lx", (unsigned long)(get32le(data + 5) >> 16) / 100u,
+                    (unsigned long)(get32le(data + 5) >> 16) % 100u, (unsigned long)(get32le(data + 5) & 0xFFFFu));
+        } else {
+            put32le(g_out + 5, 0xFFFFFFFFu);    /* no fabric */
+        }
+        n = 9u;
     } else if (data[4] == 'I') {
         g_out[4] = 'i';
         n = 5u + info((char *)g_out + 5, TEXT_MAX);

@@ -7,3 +7,4 @@ streams/
 *.o
 *.cf
 __pycache__/
+*.rgb

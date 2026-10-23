@@ -25,6 +25,7 @@ static int g_to = -1, g_from = -1;
 static pid_t g_pid = -1;
 static fabric_status_t g_st;
 static uint8_t g_scan[16];
+static uint32_t g_disp_ctrl = 3000u << 16;
 static uint32_t g_scan_n;
 
 int fabric_init(void)
@@ -127,6 +128,21 @@ uint32_t fabric_read(uint8_t *p, uint32_t max)
     for (i = 0; i < (uint32_t)n; i++)
         scan(p[i]);
     return (uint32_t)n;
+}
+
+void fabric_display_set(uint32_t ctrl)
+{
+    g_disp_ctrl = ctrl;
+}
+
+uint32_t fabric_display_ctrl(void)
+{
+    return g_disp_ctrl;
+}
+
+uint32_t fabric_display_status(void)
+{
+    return 0;
 }
 
 void fabric_status(fabric_status_t *st)

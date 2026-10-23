@@ -16,6 +16,9 @@
 --   20 PICTURES  RO  decoded pictures
 --   24 SIZE      RO  [11:0] width, [27:16] height (luma samples)
 --   28 CTRL      WO  [0] = 1: reset link and decoder
+--   2C DISP_CTRL RW  display (h264_disp): [0] off, [1] colour bars, [2] bit
+--                    reversed lanes, [31:16] stream frame rate * 100 (3000)
+--   30 DISP_STAT RO  [15:0] frame switches, [31:16] lines shown black (late data)
 -- ============================================================================
 library ieee;
 use ieee.std_logic_1164.all;
@@ -50,7 +53,10 @@ entity h264_apb_bridge is
         i_stream_done : in  std_logic;
         i_width     : in  std_logic_vector(11 downto 0);
         i_height    : in  std_logic_vector(11 downto 0);
-        o_soft_rst  : out std_logic         -- CTRL[0] written (16 cycles)
+        o_soft_rst  : out std_logic;        -- CTRL[0] written (16 cycles)
+        -- display control / status
+        o_disp_ctrl : out std_logic_vector(31 downto 0);
+        i_disp_status : in std_logic_vector(31 downto 0) := (others => '0')
     );
 end entity;
 
@@ -82,7 +88,9 @@ architecture rtl of h264_apb_bridge is
     signal srst_cnt : natural range 0 to 16;
     signal rd_acc, wr_acc : std_logic;
     signal tx_free  : txp_t;
+    signal disp_ctrl : std_logic_vector(31 downto 0);
 begin
+    o_disp_ctrl <= disp_ctrl;
     u_txram : entity work.h264_ram_sdp
         generic map (G_AW => G_TX_AW, G_DW => 34)
         port map (clk => clk, we => tx_we, waddr => tx_wp(G_TX_AW - 1 downto 0), wdata => tx_wd,
@@ -121,6 +129,8 @@ begin
             when "001001" =>
                 r(11 downto 0) := i_width;
                 r(27 downto 16) := i_height;
+            when "001011" => r := disp_ctrl;
+            when "001100" => r := i_disp_status;
             when others => null;
         end case;
         prdata <= r;
@@ -156,6 +166,8 @@ begin
                             srst_cnt <= 16;
                             flush := true;
                         end if;
+                    when "001011" =>
+                        disp_ctrl <= pwdata;
                     when others => null;
                 end case;
             end if;
@@ -214,6 +226,7 @@ begin
             end if;
             if rst = '1' then
                 srst_cnt <= 0;
+                disp_ctrl <= x"0BB80000";      -- 30 fps, display on
             end if;
         end if;
     end process;
