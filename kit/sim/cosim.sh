@@ -10,7 +10,8 @@
 #
 # <name>.264 / .ref.yuv / .info come from scripts/gen_streams.sh.  The RTL
 # simulation is thousands of times slower than the hardware, so the PC
-# program runs with long time-outs (H264_RTO) and the display at 60 fps.
+# program runs with long time-outs (H264_RTO, WAIT_S for the decoder after
+# the last byte, ~100 s per CIF picture here) and the display at 60 fps.
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -53,7 +54,7 @@ done
 grep -E "^(fw|ip|fabric|link) " "$OUT/$NAME.info.txt"
 echo "== sending $NAME.264 ($w x $h, $frames frames)"
 t0=$(date +%s)
-$SEND --fps 60 --wait-timeout 1800 "$SDIR/$NAME.264" 2>&1 | tr '\r' '\n' | grep -v "^$" | grep -v "sent " | tail -4
+$SEND --fps 60 --wait-timeout ${WAIT_S:-7200} "$SDIR/$NAME.264" 2>&1 | tr '\r' '\n' | grep -v "^$" | grep -v "sent " | tail -4
 echo "== kit status after the stream ($(( $(date +%s) - t0 )) s):"
 $SEND --info 2>&1 | grep -E "^(udp_in|udp_out|udp_cut|eth_drop|pictures|width|height|dec_error|dec_done|disp_frames|disp_late_lines) "
 sleep ${TAIL_S:-60}             # let the display show the last frame
