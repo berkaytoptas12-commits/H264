@@ -665,25 +665,129 @@ Simülasyon küçük bir ekran zamanlamasıyla yapılır (varsayılan 256x192, `
 Her çalıştırmada sıfırlamadan sonraki ilk satır siyah sayılır (`late lines = 1`); okuyucunun ilk
 satırı hazırlamasından önce gelir ve beklenen bir durumdur.
 
-## 11. Dizin yapısı
+## 11. Uçtan uca: PC → Ethernet → kit → HDMI
+
+```
+ PC (h264_gui.py)  ──UDP 5000/5001──►  MSS (kit/ yazılımı)  ──FIC3 APB──►  fabric: h264_dec_hdmi_top
+ video dosyası / canlı akış             paket taşır, konsol                bağlantı + çözücü + DDR4 + ekran
+                                                                                       │ TMDS (4 hat)
+                                                                     monitör ◄── HDMI ◄┘ PF_XCVR + re-driver
+```
+
+### 11.1 Tüm döngünün simülasyonu (`kit/sim/cosim.sh`)
+
+Döngü kitte denenmeden önce bir bütün olarak simüle edildi:
+* PC tarafında gerçek `h264_send.py` videoyu gerçek UDP ile (TAP arayüzü) gönderir.
+* Kit yazılımının kendi kodu (`kit_cosim`: ağ yığını, köprü ve `fabric_mmio.c` sürücüsü) yazmaç
+  erişimlerini APB veriyolu üzerinden GHDL'de çalışan **tam fabric tasarımına**
+  (`h264_dec_hdmi_top`) iletir.
+* Testbench (`tb/tb_cosim.vhd`) DDR modelini içerir ve HDMI hatlarındaki TMDS sembollerini geri
+  çözer; kareler ffmpeg referansıyla bit bit karşılaştırılır.
+
+Simülasyon dışında kalanlar: MSS Ethernet sürücüsü ve PHY (`port_mss.c`), transceiver'ın elektriksel
+kısmı, Libero yapılandırması ve gerçek DDR denetleyicisi.
+
+```sh
+sudo kit/sim/cosim.sh streams qcif_ip
+```
+
+| Akış | Sonuç |
+|---|---|
+| qcif_ip (176x144, 8 kare) | Yazılım RTL köprüsünü buldu, ekran ayarı yazıldı. 8 resim çözüldü, `dec_error 0`, `disp_frames 8`. HDMI çıkışından 8 kare sırayla ve RGB olarak birebir, 0 TMDS hatası (37 479 APB erişimi) |
+
+### 11.2 Kitte çalıştırma sırası
+
+Her adımın sonunda neyin görülmesi gerektiği ve olmazsa nereye bakılacağı yazılıdır. Bir adım
+geçmeden sonrakine geçmeyin.
+
+**A. Libero tasarımı (fabric + MSS)**
+1. MSS yapılandırması: Video Kit'in MSS XML'inden başlayın (bölüm 9.2). GEM0 SGMII + MDIO açık,
+   FIC3 (APB) açık; MMUART0 isteğe bağlı.
+2. SmartDesign üst seviyesi:
+   * MSS bileşeni;
+   * PF_CCC: 100 MHz, çözücü saati ve FIC3 saati aynı;
+   * CORERESET_PF: reset senkron, aktif-yüksek;
+   * PF_DDR4: kitin DDR4'ü; gerekirse CoreAXI4Interconnect;
+   * `h264_dec_hdmi_top` (bölüm 10);
+   * `HDMI_PHY` (`source libero/hdmi_phy.tcl`).
+
+   Bağlantılar 9.1 ve 10.1'deki tablolardadır.
+3. I/O: DDR4 pinleri, HDMI transceiver hatları ve 148.5 MHz referans saati (bölüm 10.1, madde 4),
+   LED'ler.
+4. Sentez, yerleştirme ve SmartTime: `clk` 100 MHz, `hdmi_clk` 37.125 MHz kapanmalıdır. Bellek
+   haritasında köprünün FIC3 adresini not edin (`FABRIC_BASE`, varsayılan `0x40000000`).
+5. Kiti programlayın.
+
+   **Kontrol:** Video ve yazılım olmadan bile monitörde **renk çubukları** görünmelidir. Fabric
+   resetten çıkınca ekran kendiliğinden çubuk basar.
+
+   **Olmazsa:** transceiver'ın TX saati (`TX_CLK_STABLE`), hat sırası, P/N yönü, re-driver'ın
+   etkinleştirme pini ve PF_XCVR ayarları (bölüm 10.1). Bit sırası 4. adımda yazılımla da
+   denenebilir.
+
+**B. Kit yazılımı**
+
+6. SoftConsole'da `kit/` projesi (bölüm 9.3):
+   * `fpga_design_config`'i kendi tasarımınızın XML'inden üretin;
+   * `FABRIC_BASE`'i 4. adımdaki adrese ayarlayın;
+   * kart ayarlarını kontrol edin: `KIT_GEM`, `KIT_PHY_ADDR`, `KIT_MDIO_GEM`, PHY reset;
+   * önce hata ayıklayıcıyla (LIM) çalıştırın, sonra eNVM'e yazın.
+
+   **Kontrol:** Kitin Ethernet bağlantı ışıkları yanar. İsteğe bağlı UART kopyasında
+   "Ethernet link up" görünür.
+
+**C. Ağ**
+
+7. Kiti PC'ye doğrudan kabloyla bağlayın (GEM0'a giden RJ45). PC'nin Ethernet kartına
+   `192.168.10.1 / 255.255.255.0` verin.
+8. `python host/h264_gui.py` → **Bağlantıyı test et**. Dört adımın hepsi ✔ olmalıdır: PC adresi,
+   ping, kit yazılımı + "köprü bulundu", fabric yanıtı.
+
+   **Olmazsa** test hangi adımın kaldığını ve olası nedeni yazar:
+   * PC adresi kalıyorsa: PC'nin IP ayarı;
+   * ping kalıyorsa: kablo, PHY/MDIO ayarı, `APP_IP`;
+   * köprü bulunamıyorsa: bitstream ya da `FABRIC_BASE`;
+   * ping var ama yanıt yoksa: güvenlik duvarı ya da FIC3.
+
+   "Kit konsolu" sekmesi yazılımın mesajlarını gösterir.
+
+**D. HDMI ve video**
+
+9. GUI'de "renk çubukları (HDMI testi)" seçeneğini açıp kapatın. Monitörde çubuklar ile siyah ekran
+   arasında geçiş görülmelidir.
+
+   Görüntü hiç yoksa "TMDS bit sırası ters" seçeneğini deneyin (`h264_send.py --bars --bitrev`).
+   Tutarsa seçeneği işaretli bırakın.
+10. Önce küçük bir Baseline `.264` gönderin, sonra herhangi bir video gönderin. MP4/MKV gibi dosyalar
+    ffmpeg ile kendiliğinden dönüştürülür. Boyutu `1920x1080` seçin; kare hızı "otomatik".
+
+    **Kontrol:** ilerleme çubuğu ilerler, alt satırda resim sayısı artar, monitörde video oynar.
+    Kare hızı dosyadan okunur ve gönderim oynatma hızına iner.
+
+    **Takılırsa:** `h264_send.py --info` çıktısındaki `pictures`, `disp_frames`, `disp_late_lines`
+    ve `dec_error` değerlerine bakın. `disp_late_lines` sürekli artıyorsa DDR bant genişliğini ya da
+    AXI bağlantısını kontrol edin.
+11. Canlı akış için ffmpeg'i boruyla bağlayın (bölüm 9.4).
+
+## 12. Dizin yapısı
 
 ```
 model/    C referans modeli (h264_model.c)
 rtl/      VHDL-2008 RTL (çözücü; h264_uart / h264_link / h264_dec_uart_top: seri bağlantı;
           h264_apb_bridge / h264_dec_mss_top: MSS üzerinden Ethernet; h264_disp / h264_tmds /
           h264_axi_rd_arb / h264_dec_hdmi_top: HDMI çıkışı)
-tb/       GHDL testbench'leri (tb_parse, tb_top, tb_link, tb_apb, tb_disp, tb_util_pkg)
+tb/       GHDL testbench'leri (tb_parse, tb_top, tb_link, tb_apb, tb_disp, tb_cosim, tb_util_pkg)
 scripts/  gen_streams.sh, stream_tools.py, gen_tables.py, run_sim.sh, yuvcmp.py,
           synth_estimate.sh, pf_depth.py, disp_check.py
 host/     PC programları: h264_send.py (komut satırı), h264_gui.py (arayüz), h264link.py (protokol,
           seri ve UDP), fpga_emu.py (FPGA tarafının yazılım modeli), test_link.py, make_vectors.py
 kit/      MSS bare-metal Ethernet köprüsü: src/ (taşınabilir), mss/ (Microchip HAL portu),
-          sim/ (Linux/TAP derlemesi)
+          sim/ (Linux/TAP derlemesi, test_udp.sh, tüm döngü ortak simülasyonu cosim.sh)
 libero/   create_project.tcl (Libero SoC projesi + sentez), h264_dec.sdc, h264_hdmi.sdc,
           hdmi_phy.tcl (HDMI transceiver bileşenleri), uart_pins.pdc (şablon)
 ```
 
-## 12. Bilinen sınırlar / yol haritası
+## 13. Bilinen sınırlar / yol haritası
 
 * Main/High profil (CABAC, B slice, 8x8 dönüşüm) desteklenmiyor.
 * Çıkış sırası çözme sırasıdır; B slice olmayan akışlarda bu, gösterim sırasıyla aynıdır.
