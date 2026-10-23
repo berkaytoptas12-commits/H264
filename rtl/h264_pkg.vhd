@@ -183,6 +183,7 @@ package h264_pkg is
         ok  : std_logic;                 -- code fits into the window
     end record;
     function ue_decode(w : std_logic_vector) return eg_t;
+    function ue_decode_p1(w : std_logic_vector) return eg_t;    -- val = codeNum + 1
     function se_from_ue(k : unsigned(31 downto 0)) return signed;
 
     function clip_u8(v : integer) return unsigned;
@@ -265,6 +266,25 @@ package body h264_pkg is
             -- the 2*lz+1 code bits, right aligned, are codeNum + 1
             sh := shift_right(unsigned(wv), N - 1 - 2 * lz);
             r.val := resize(sh, 32) - 1;
+            r.len := to_unsigned(2 * lz + 1, 7);
+            r.ok := '1';
+        end if;
+        return r;
+    end function;
+
+    function ue_decode_p1(w : std_logic_vector) return eg_t is
+        constant N   : natural := w'length;
+        variable wv  : std_logic_vector(N - 1 downto 0);
+        variable lz  : natural;
+        variable r   : eg_t;
+    begin
+        wv := w;
+        lz := clz(wv);
+        r.val := (others => '0');
+        r.len := (others => '0');
+        r.ok := '0';
+        if lz <= 31 and 2 * lz + 1 <= N then
+            r.val := resize(shift_right(unsigned(wv), N - 1 - 2 * lz), 32);
             r.len := to_unsigned(2 * lz + 1, 7);
             r.ok := '1';
         end if;

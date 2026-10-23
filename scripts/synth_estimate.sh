@@ -36,6 +36,7 @@ for m in "${mods[@]}"; do
     top=$(grep -o "^module [a-zA-Z0-9_]*" "$m.v" | tail -1 | cut -d' ' -f2)
     cat > "$m.ys" <<EOT
 read_verilog $m.v
+proc
 setattr -unset init
 synth_microchip -top $top -family polarfire -noiopad -noclkbuf
 tee -o $m.stat stat

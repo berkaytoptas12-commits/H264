@@ -130,8 +130,8 @@ architecture rtl of h264_mbparse is
     -- state
     -- ------------------------------------------------------------------
     type state_t is (ST_IDLE, ST_DIV, ST_MB_START, ST_LB_RD0, ST_LB_RD1, ST_LB_RD2,
-                     ST_SKIPRUN, ST_SKIP_NB, ST_SKIP_MVP, ST_MBTYPE, ST_PCM_ALIGN, ST_PCM_DATA,
-                     ST_I4MODE, ST_CHROMA, ST_SUBTYPE, ST_REFIDX, ST_MVP_NB, ST_MVP, ST_MVDX, ST_MVDY,
+                     ST_SKIPRUN, ST_SKIP_NB, ST_SKIP_MVP, ST_SKIP_MVP2, ST_MBTYPE, ST_PCM_ALIGN, ST_PCM_DATA,
+                     ST_I4MODE, ST_CHROMA, ST_SUBTYPE, ST_REFIDX, ST_MVP_NB, ST_MVP, ST_MVP2, ST_MVDX, ST_MVDY,
                      ST_CBP, ST_QPD, ST_RES_NEXT, ST_CT, ST_T1, ST_LEVEL, ST_TZ, ST_RUN,
                      ST_WRBLK, ST_BS, ST_EMIT, ST_MORE, ST_DONE);
     signal st : state_t;
@@ -212,18 +212,27 @@ architecture rtl of h264_mbparse is
 
     signal consume   : unsigned(6 downto 0);   -- combinational: cons_q gated with rdy_s
     signal cons_q    : unsigned(6 downto 0);   -- bits used by the current state
-    signal cqz_q     : std_logic;              -- cons_q = 0
     signal cz_q      : std_logic;              -- nothing consumed in the previous cycle
     signal st_same   : std_logic;              -- st did not change in the previous cycle
     signal rdy_s     : std_logic;
+    -- VLC table numbers of total_zeros / run_before (registered with tc / zl)
+    signal tz_tab_r  : natural range 0 to 17;
+    signal rb_tab_r  : natural range 0 to 6;
     -- registered bitstream decode (computed from the window of the previous
     -- cycle and the current context; valid when the state did not change and
     -- nothing was consumed in the previous cycle)
+    -- level_prefix / level_suffix fields (decode stage)
+    type levd_t is record
+        pfx  : natural range 0 to 15;
+        ssz  : natural range 0 to 12;
+        sfx  : natural range 0 to 4095;
+        len  : natural range 0 to 31;
+        err  : std_logic;
+    end record;
+    -- level value and the next suffixLength (use stage)
     type lev_t is record
         lv   : integer range -8192 to 8191;
-        len  : natural range 0 to 31;
         sufn : natural range 0 to 6;
-        err  : std_logic;
     end record;
     signal w_q       : std_logic_vector(63 downto 0);
     signal eg_q      : eg_t;
@@ -231,9 +240,15 @@ architecture rtl of h264_mbparse is
     signal ct_q      : natural range 0 to 4095;
     signal tz_q      : natural range 0 to 4095;
     signal rb_q      : natural range 0 to 4095;
-    signal lev_q     : lev_t;
+    signal lev_q     : levd_t;
     -- motion vector prediction neighbours
     signal nbA_r, nbB_r, nbC_r : nb_t;
+    -- prediction candidates (ST_MVP / ST_SKIP_MVP), selected in the next state
+    signal mv_dir_ok : std_logic;            -- directional / zero (P_Skip) prediction
+    signal mv_dir    : mv_t;
+    signal mv_m1     : std_logic;            -- exactly one neighbour with the same reference
+    signal mv_m1v    : mv_t;
+    signal mv_med    : mv_t;
     signal cref_r    : signed(5 downto 0);
     signal done_r    : std_logic;
     signal err       : std_logic;
@@ -242,11 +257,20 @@ architecture rtl of h264_mbparse is
     constant C_INTRA : signed(5 downto 0) := to_signed(-1, 6);
 
 
+    -- median from three parallel comparisons
     function med3(a, b, c : signed(15 downto 0)) return signed is
-        variable mn, mx : signed(15 downto 0);
+        variable ab, ac, bc : boolean;
     begin
-        if a < b then mn := a; mx := b; else mn := b; mx := a; end if;
-        if c < mn then return mn; elsif c > mx then return mx; else return c; end if;
+        ab := a < b;
+        ac := a < c;
+        bc := b < c;
+        if ab /= ac then
+            return a;           -- a between b and c
+        elsif ab then
+            if bc then return b; else return c; end if;   -- a is the minimum
+        else
+            if bc then return c; else return b; end if;   -- a is the maximum
+        end if;
     end function;
 
     function absdiff_ge4(a, b : signed(15 downto 0)) return boolean is
@@ -264,52 +288,85 @@ architecture rtl of h264_mbparse is
     end function;
 
     -- CAVLC level_prefix / level_suffix (9.2.2.1) on a 32 bit window
-    function level_decode(w32 : std_logic_vector(31 downto 0); sl_in : natural; first_after_t1 : boolean)
-        return lev_t is
-        variable r : lev_t;
-        variable pfx, ssz, sfx, sl_v : natural;
-        variable lc, lv : integer;
-        variable sh : unsigned(31 downto 0);
+    -- total_zeros table: 0..14 luma / chroma AC by TotalCoeff, 15..17 chroma DC
+    function tz_tab_of(t : unsigned(4 downto 0); cdc : std_logic) return natural is
+    begin
+        if t = 0 or t > 15 then
+            return 0;
+        elsif cdc = '1' then
+            if t > 3 then
+                return 17;
+            end if;
+            return 15 + to_integer(t) - 1;
+        end if;
+        return to_integer(t) - 1;
+    end function;
+
+    -- run_before table by zerosLeft
+    function rb_tab_of(z : unsigned(4 downto 0)) return natural is
+    begin
+        if z >= 7 then
+            return 6;
+        elsif z = 0 then
+            return 0;
+        end if;
+        return to_integer(z) - 1;
+    end function;
+
+    -- level_prefix, suffix size and value, number of bits
+    function level_pre(w32 : std_logic_vector(31 downto 0); sl_in : natural) return levd_t is
+        variable r : levd_t;
+        variable pfx, ssz : natural;
     begin
         r.err := '0';
         pfx := clz(w32);
-        sl_v := sl_in;
         if pfx > 15 then
             r.err := '1';
             pfx := 15;
         end if;
-        if pfx = 14 and sl_v = 0 then
+        if pfx = 14 and sl_in = 0 then
             ssz := 4;
         elsif pfx >= 15 then
             ssz := 12;
         else
-            ssz := sl_v;
+            ssz := sl_in;
         end if;
         -- suffix: the ssz bits after the prefix and its terminating one
-        sh := shift_left(unsigned(w32), pfx + 1);
         if ssz > 0 then
-            sfx := to_integer(shift_right(sh, 32 - ssz));
+            r.sfx := to_integer(shift_right(unsigned(w32), 31 - pfx - ssz)) mod 2 ** ssz;
         else
-            sfx := 0;
+            r.sfx := 0;
         end if;
-        lc := pfx * (2 ** sl_v) + sfx;
-        if pfx >= 15 and sl_v = 0 then
+        r.pfx := pfx;
+        r.ssz := ssz;
+        r.len := pfx + 1 + ssz;
+        return r;
+    end function;
+
+    -- levelCode -> level value; suffixLength update (|level| > 3 << (sl - 1)
+    -- is the same as levelCode >= 3 << sl)
+    function level_post(d : levd_t; sl_in : natural; first_after_t1 : boolean) return lev_t is
+        variable r : lev_t;
+        variable sl_v : natural;
+        variable lc : integer;
+    begin
+        sl_v := sl_in;
+        lc := d.pfx * (2 ** sl_v) + d.sfx;
+        if d.pfx >= 15 and sl_v = 0 then
             lc := lc + 15;
         end if;
         if first_after_t1 then
             lc := lc + 2;
         end if;
         if lc mod 2 = 0 then
-            lv := (lc + 2) / 2;
+            r.lv := (lc + 2) / 2;
         else
-            lv := -((lc + 1) / 2);
+            r.lv := -((lc + 1) / 2);
         end if;
-        r.lv := lv;
-        r.len := pfx + 1 + ssz;
         if sl_v = 0 then
             sl_v := 1;
         end if;
-        if (lv > 3 * (2 ** (sl_v - 1)) or lv < -3 * (2 ** (sl_v - 1))) and sl_v < 6 then
+        if lc >= 3 * (2 ** sl_v) and sl_v < 6 then
             sl_v := sl_v + 1;
         end if;
         r.sufn := sl_v;
@@ -384,7 +441,8 @@ begin
         variable ok      : boolean;
         variable egd     : eg_t;
         variable ctd, tzd, rbd : natural range 0 to 4095;
-        variable levd    : lev_t;
+        variable levd    : levd_t;
+        variable levp    : lev_t;
         variable cq      : unsigned(6 downto 0);
         variable st_v    : state_t;
 
@@ -488,29 +546,14 @@ begin
                 ctd := vlc_lookup(CT_ROM, CT_S, CT_LZMAX, 0, br_win(63 downto 48));
             end if;
             ct_q <= ctd;
-            if tc = 0 or tc > 15 then
-                tab := 0;
-            elsif blk_cdc = '1' then
-                if tc > 3 then
-                    tab := 17;
-                else
-                    tab := 15 + to_integer(tc) - 1;
-                end if;
-            else
-                tab := to_integer(tc) - 1;
-            end if;
-            tzd := vlc_lookup(TZ_ROM, TZ_S, TZ_LZMAX, tab, br_win(63 downto 48));
+            -- tc / blk_cdc are set at least two cycles before total_zeros is
+            -- read, so its table number may lag them by one cycle
+            tz_tab_r <= tz_tab_of(tc, blk_cdc);
+            tzd := vlc_lookup(TZ_ROM, TZ_S, TZ_LZMAX, tz_tab_r, br_win(63 downto 48));
             tz_q <= tzd;
-            if zl >= 7 then
-                tab := 6;
-            elsif zl = 0 then
-                tab := 0;
-            else
-                tab := to_integer(zl) - 1;
-            end if;
-            rbd := vlc_lookup(RB_ROM, RB_S, RB_LZMAX, tab, br_win(63 downto 48));
+            rbd := vlc_lookup(RB_ROM, RB_S, RB_LZMAX, rb_tab_r, br_win(63 downto 48));
             rb_q <= rbd;
-            levd := level_decode(br_win(63 downto 32), to_integer(suflen), lvl_i = resize(t1, 5) and t1 < 3);
+            levd := level_pre(br_win(63 downto 32), to_integer(suflen));
             lev_q <= levd;
             -- bits consumed by the element of the current state (must match
             -- the use stage below, checked by the assertion at the end)
@@ -555,8 +598,7 @@ begin
                     null;
             end case;
             cons_q <= cq;
-            cqz_q <= to_sl(cq = 0);
-            cz_q <= not rdy_s or cqz_q;      -- nothing consumed in this cycle
+            cz_q <= to_sl(rdy_s = '0' or cons_q = 0);   -- nothing consumed in this cycle
             -- use stage
             w := w_q;
             w32 := w(63 downto 32);
@@ -577,6 +619,7 @@ begin
                 tc <= (others => '0');
                 t1 <= (others => '0');
                 zl <= (others => '0');
+                rb_tab_r <= 0;
                 suflen <= (others => '0');
                 lvl_i <= (others => '0');
                 blk_cdc <= '0';
@@ -701,26 +744,33 @@ begin
                         nbA := nbA_r;
                         nbB := nbB_r;
                         nbC := nbC_r;
-                        mvp := MV_ZERO;
-                        if avA = '1' and avB = '1' and
-                           not (nbA.ref = 0 and nbA.mv.x = 0 and nbA.mv.y = 0) and
-                           not (nbB.ref = 0 and nbB.mv.x = 0 and nbB.mv.y = 0) then
-                            if nbB.ref = C_NA and nbC.ref = C_NA and nbA.ref /= C_NA then
-                                nbB := nbA;
-                                nbC := nbA;
-                            end if;
-                            match := 0;
-                            if nbA.ref = 0 then match := match + 1; end if;
-                            if nbB.ref = 0 then match := match + 1; end if;
-                            if nbC.ref = 0 then match := match + 1; end if;
-                            if match = 1 then
-                                if nbA.ref = 0 then mvp := nbA.mv;
-                                elsif nbB.ref = 0 then mvp := nbB.mv;
-                                else mvp := nbC.mv; end if;
-                            else
-                                mvp.x := med3(nbA.mv.x, nbB.mv.x, nbC.mv.x);
-                                mvp.y := med3(nbA.mv.y, nbB.mv.y, nbC.mv.y);
-                            end if;
+                        mv_dir <= MV_ZERO;
+                        mv_dir_ok <= to_sl(not (avA = '1' and avB = '1' and
+                                                not (nbA.ref = 0 and nbA.mv.x = 0 and nbA.mv.y = 0) and
+                                                not (nbB.ref = 0 and nbB.mv.x = 0 and nbB.mv.y = 0)));
+                        if nbB.ref = C_NA and nbC.ref = C_NA and nbA.ref /= C_NA then
+                            nbB := nbA;
+                            nbC := nbA;
+                        end if;
+                        match := 0;
+                        if nbA.ref = 0 then match := match + 1; end if;
+                        if nbB.ref = 0 then match := match + 1; end if;
+                        if nbC.ref = 0 then match := match + 1; end if;
+                        mv_m1 <= to_sl(match = 1);
+                        if nbA.ref = 0 then mv_m1v <= nbA.mv;
+                        elsif nbB.ref = 0 then mv_m1v <= nbB.mv;
+                        else mv_m1v <= nbC.mv; end if;
+                        mv_med.x <= med3(nbA.mv.x, nbB.mv.x, nbC.mv.x);
+                        mv_med.y <= med3(nbA.mv.y, nbB.mv.y, nbC.mv.y);
+                        st_v := ST_SKIP_MVP2;
+
+                    when ST_SKIP_MVP2 =>
+                        if mv_dir_ok = '1' then
+                            mvp := mv_dir;
+                        elsif mv_m1 = '1' then
+                            mvp := mv_m1v;
+                        else
+                            mvp := mv_med;
                         end if;
                         mvs <= (others => mvp);
                         refs <= (others => (others => '0'));
@@ -985,6 +1035,7 @@ begin
                         nbB := nbB_r;
                         nbC := nbC_r;
                         ok := false;
+                        mvp := MV_ZERO;
                         if shape = 1 then
                             if pidx = 0 and nbB.ref = cref then
                                 mvp := nbB.mv; ok := true;
@@ -998,25 +1049,32 @@ begin
                                 mvp := nbC.mv; ok := true;
                             end if;
                         end if;
-                        if not ok then
-                            if nbB.ref = C_NA and nbC.ref = C_NA and nbA.ref /= C_NA then
-                                nbB := nbA;
-                                nbC := nbA;
-                            end if;
-                            match := 0;
-                            if nbA.ref = cref then match := match + 1; end if;
-                            if nbB.ref = cref then match := match + 1; end if;
-                            if nbC.ref = cref then match := match + 1; end if;
-                            if match = 1 then
-                                if nbA.ref = cref then mvp := nbA.mv;
-                                elsif nbB.ref = cref then mvp := nbB.mv;
-                                else mvp := nbC.mv; end if;
-                            else
-                                mvp.x := med3(nbA.mv.x, nbB.mv.x, nbC.mv.x);
-                                mvp.y := med3(nbA.mv.y, nbB.mv.y, nbC.mv.y);
-                            end if;
+                        mv_dir_ok <= to_sl(ok);
+                        mv_dir <= mvp;
+                        if nbB.ref = C_NA and nbC.ref = C_NA and nbA.ref /= C_NA then
+                            nbB := nbA;
+                            nbC := nbA;
                         end if;
-                        mvp_r <= mvp;
+                        match := 0;
+                        if nbA.ref = cref then match := match + 1; end if;
+                        if nbB.ref = cref then match := match + 1; end if;
+                        if nbC.ref = cref then match := match + 1; end if;
+                        mv_m1 <= to_sl(match = 1);
+                        if nbA.ref = cref then mv_m1v <= nbA.mv;
+                        elsif nbB.ref = cref then mv_m1v <= nbB.mv;
+                        else mv_m1v <= nbC.mv; end if;
+                        mv_med.x <= med3(nbA.mv.x, nbB.mv.x, nbC.mv.x);
+                        mv_med.y <= med3(nbA.mv.y, nbB.mv.y, nbC.mv.y);
+                        st_v := ST_MVP2;
+
+                    when ST_MVP2 =>
+                        if mv_dir_ok = '1' then
+                            mvp_r <= mv_dir;
+                        elsif mv_m1 = '1' then
+                            mvp_r <= mv_m1v;
+                        else
+                            mvp_r <= mv_med;
+                        end if;
                         st_v := ST_MVDX;
 
                     when ST_MVDX =>
@@ -1280,11 +1338,12 @@ begin
                     when ST_LEVEL =>
                         if rdy then
                             cons := to_unsigned(lev_q.len, 7);
+                            levp := level_post(lev_q, to_integer(suflen), lvl_i = resize(t1, 5) and t1 < 3);
                             if lev_q.err = '1' then
                                 err <= '1';
                             end if;
-                            lvl(to_integer(lvl_i(3 downto 0))) <= to_signed(lev_q.lv, 16);
-                            suflen <= to_unsigned(lev_q.sufn, 3);
+                            lvl(to_integer(lvl_i(3 downto 0))) <= to_signed(levp.lv, 16);
+                            suflen <= to_unsigned(levp.sufn, 3);
                             lvl_i <= lvl_i + 1;
                             if lvl_i + 1 = tc then
                                 st_v := ST_TZ;
@@ -1294,16 +1353,21 @@ begin
                     when ST_TZ =>
                         if tc = blk_max then
                             zl <= (others => '0');
+                            rb_tab_r <= 0;
                             pos <= signed(resize(tc, 6)) - 1;
                             run_i <= (others => '0');
                             st_v := ST_RUN;
                         elsif rdy then
+                            -- synthesis translate_off
+                            assert tz_tab_r = tz_tab_of(tc, blk_cdc) report "mbparse: stale total_zeros table" severity failure;
+                            -- synthesis translate_on
                             e := tz_q;
                             cons := to_unsigned(e mod 32, 7);
                             if e mod 32 = 0 then
                                 err <= '1';
                             end if;
                             zl <= to_unsigned(e / 32, 5);
+                            rb_tab_r <= rb_tab_of(to_unsigned(e / 32, 5));
                             pos <= signed(resize(tc, 6)) + to_signed(e / 32, 6) - 1;
                             run_i <= (others => '0');
                             st_v := ST_RUN;
@@ -1331,6 +1395,9 @@ begin
                             pos <= pos - 1;
                             run_i <= run_i + 1;
                         elsif rdy then
+                            -- synthesis translate_off
+                            assert rb_tab_r = rb_tab_of(zl) report "mbparse: stale run_before table" severity failure;
+                            -- synthesis translate_on
                             blk(r) <= lvl(to_integer(run_i(3 downto 0)));
                             e := rb_q;
                             cons := to_unsigned(e mod 32, 7);
@@ -1339,6 +1406,7 @@ begin
                                 e := 0;
                             end if;
                             zl <= zl - to_unsigned(e / 32, 5);
+                            rb_tab_r <= rb_tab_of(zl - to_unsigned(e / 32, 5));
                             pos <= pos - 1 - to_signed(e / 32, 6);
                             run_i <= run_i + 1;
                         end if;

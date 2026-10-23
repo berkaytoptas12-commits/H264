@@ -12,6 +12,7 @@ This is only a relative measure for finding long paths; the real timing
 comes from Libero (SmartTime).
 """
 import json
+import re
 import sys
 from collections import defaultdict
 
@@ -82,11 +83,21 @@ def main():
                 stack.append(m)
     if len(order) != len(nodes):
         print("warning: combinational loop(s), %d nodes not ordered" % (len(nodes) - len(order)))
+    # prefer source names over GHDL (nNNN_q / nNNN_o) and yosys ($...) names
+    def rank(nm):
+        if nm.startswith("$"):
+            return 0
+        if re.match(r"^n[0-9]+_[a-z]+$", nm):
+            return 1
+        return 2
     names = {}
+    best_rank = {}
     for nm, v in mod["netnames"].items():
+        r = rank(nm)
         for i, b in enumerate(v["bits"]):
-            if isinstance(b, int) and (b not in names or nm.startswith("\\") or not nm.startswith("$")):
+            if isinstance(b, int) and r > best_rank.get(b, -1):
                 names[b] = "%s[%d]" % (nm, i)
+                best_rank[b] = r
     best = sorted(((arr[e], e) for e in ends if e in arr), reverse=True)
     print("%s: max depth %.1f levels" % (top, best[0][0] if best else 0))
     shown = set()

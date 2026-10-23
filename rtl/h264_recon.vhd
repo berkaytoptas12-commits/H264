@@ -6,12 +6,15 @@
 --   * per 4x4 block a 6 stage pipeline, one block per cycle:
 --       S0 issue      coefficient block / prediction block address
 --       S1            buffer reads (2 cycle latency)
---       S2 dequant    16 coefficients in parallel
---       S3 / S4       inverse transform rows / columns
---       S5 predict    Intra4x4 (9 modes), Intra16x16 (4), chroma (4) or inter,
---                     add residual, clip; updates the neighbour registers so
---                     that the next block (next cycle) predicts from it
---       S6 write      4x4 block to the deblocking input buffer
+--       S2 dequant    16 coefficients in parallel (scale << qp/6 per MB)
+--       S3            DC substitution, inverse transform rows
+--       S4            inverse transform columns, Intra4x4 neighbour
+--                     selection, plane base, chroma DC prediction value
+--       S5 predict    Intra4x4 (9 modes), Intra16x16 (4), chroma (4) or inter
+--       S6            add residual, clip, write the 4x4 block to the
+--                     deblocking input buffer, update the neighbour registers
+--     Intra4x4 luma blocks depend on the previous block (S6 -> S4), so they
+--     are issued every third cycle.
 --   * I_PCM samples are copied from the coefficient buffer
 -- Neighbours: line buffer (unfiltered bottom row of the macroblock row above)
 -- and registers for the left column.
@@ -281,7 +284,7 @@ architecture rtl of h264_recon is
     end function;
 
 
-    type state_t is (R_IDLE, R_LB0, R_LB1, R_LB2, R_DC0, R_DC1, R_DC2, R_DC3, R_DCH1, R_DCH2,
+    type state_t is (R_IDLE, R_LB0, R_LB1, R_LB2, R_DC0, R_DC1, R_DC2, R_DC3, R_DC4, R_DC5, R_DC6,
                      R_RUN, R_END);
     signal st : state_t;
     signal st_dbg : natural;
@@ -317,6 +320,23 @@ architecture rtl of h264_recon is
     signal ldc     : c20_arr16_t;
     signal cdc     : c20_arr8_t;
     signal qrem_l, qdiv_l, qrem_c, qdiv_c : natural range 0 to 15;
+    -- dequantisation scale per coefficient position: LevelScale << qp/6
+    type scl_arr_t is array (0 to 15) of natural range 0 to 8191;
+    signal scl_l, scl_c : scl_arr_t;
+    -- DC / plane parameter pipeline (once per macroblock)
+    type int8_t is array (0 to 7) of integer range -4096 to 4095;
+    type int4x2_t is array (0 to 1) of int8_t;
+    type int2_t is array (0 to 1) of integer range -16384 to 16383;
+    signal wh, wv  : int8_t;           -- (i+1) * (difference) luma
+    signal cwh, cwv : int4x2_t;        -- chroma (entries 0..3)
+    signal sum_t, sum_l : natural range 0 to 4095;
+    signal h_r, v_r : integer range -32768 to 32767;
+    signal ch_r, cv_r : int2_t;
+    signal tmp_r   : c20_arr16_t;
+    type prod_arr16_t is array (0 to 15) of signed(39 downto 0);
+    type prod_arr8_t is array (0 to 7) of signed(39 downto 0);
+    signal prod_l  : prod_arr16_t;
+    signal prod_c  : prod_arr8_t;
 
     -- Intra16x16 / chroma prediction parameters
     subtype pint_t is integer range -262144 to 262143;
@@ -340,10 +360,17 @@ architecture rtl of h264_recon is
     signal pp2, pp3, pp4 : pix16_t;
     signal dq2     : c20_arr16_t;
     signal rt3     : c20_arr16_t;
-    signal res4    : c20_arr16_t;
+    signal res4, res5 : c20_arr16_t;
     signal base4   : pint_t := 0;
-    signal rec5    : pix16_t;
-    signal pcm2    : std_logic;
+    signal pred5   : pix16_t;
+    signal gap     : natural range 0 to 2;   -- issue spacing for Intra4x4
+    -- Intra4x4 neighbours of the block in S5 (selected in S4)
+    signal p4_t8   : pix8_t;
+    signal p4_l4   : pix4_t;
+    signal p4_tl   : pix_t;
+    signal p4_at, p4_al : boolean;
+    signal p4_mode : natural range 0 to 15;
+    signal p4_cs   : pix_t;                  -- chroma DC prediction value
 
     signal coef_free, pred_free : std_logic;
 
@@ -411,7 +438,10 @@ begin
                 pn(i) <= pn(i - 1);
             end loop;
             pv(0) <= '0';
-            if st = R_RUN and issue < 24 then
+            if gap /= 0 then
+                gap <= gap - 1;
+            end if;
+            if st = R_RUN and issue < 24 and gap = 0 then
                 -- S0: issue block 'issue'
                 n := issue;
                 if n < 16 then
@@ -426,6 +456,9 @@ begin
                 pv(0) <= '1';
                 pn(0) <= n;
                 issue <= issue + 1;
+                if mb.mbtype = MBT_I4x4 and n < 16 then
+                    gap <= 2;
+                end if;
             end if;
             -- S1: prediction block read (registered in the buffer, valid in S2)
             -- S2: dequantisation (coefficient block arrives now)
@@ -434,21 +467,20 @@ begin
                 if n < 16 then
                     r := blkr(n);
                     need_c := mb.nz(r) = '1';
-                    qr := qrem_l;
-                    qd := qdiv_l;
                 else
                     need_c := mb.nz(CB_CB + n - 16) = '1';
-                    qr := qrem_c;
-                    qd := qdiv_c;
                 end if;
                 for i in 0 to 15 loop
                     cf := signed(cr_data((i / 4) * 64 + (i mod 4) * 16 + 15 downto (i / 4) * 64 + (i mod 4) * 16));
-                    prod := cf * to_signed(dq_v(qr, i), 16);
-                    if need_c then
-                        dq2(i) <= resize(shift_left(prod, qd), 20);
-                    else
-                        dq2(i) <= (others => '0');
+                    if not need_c then
+                        cf := (others => '0');
                     end if;
+                    if n < 16 then
+                        prod := cf * to_signed(scl_l(i), 16);
+                    else
+                        prod := cf * to_signed(scl_c(i), 16);
+                    end if;
+                    dq2(i) <= resize(prod, 20);
                     if mb.mbtype = MBT_IPCM then
                         pp2(i) <= to_integer(unsigned(cr_data((i / 4) * 64 + (i mod 4) * 16 + 7 downto (i / 4) * 64 + (i mod 4) * 16)));
                     else
@@ -470,35 +502,18 @@ begin
                 rt3 <= idct_rows(lv);
                 pp3 <= pp2;
             end if;
-            -- S4: column transform, plane base for the block
+            -- S4: column transform, plane base, Intra4x4 neighbours,
+            --     chroma DC prediction
             if pv(3) = '1' then
                 res4 <= idct_cols(rt3);
                 pp4 <= pp3;
                 n := pn(3);
                 if n < 16 then
                     r := blkr(n);
-                    base4 <= pl_a + pbx(r mod 4) + pcy(r / 4) + 16;
-                else
-                    c := (n - 16) / 4;
-                    b := (n - 16) mod 4;
-                    base4 <= cpl_a(c) + cpbx(c)(b mod 2) + cpcy(c)(b / 2) + 16;
-                end if;
-            end if;
-            -- S5: prediction + residual
-            if pv(4) = '1' then
-                n := pn(4);
-                if n < 16 then
-                    r := blkr(n);
                     bx := r mod 4;
                     by := r / 4;
-                else
-                    c := (n - 16) / 4;
-                    b := (n - 16) mod 4;
-                    bx := b mod 2;
-                    by := b / 2;
-                end if;
-                pp := pp4;
-                if mb.mbtype = MBT_I4x4 and n < 16 then
+                    base4 <= pl_a + pbx(bx) + pcy(by) + 16;
+                    -- neighbours (blocks before this one are already in rowr / colr)
                     for i in 0 to 3 loop
                         if by = 0 then
                             t8(i) := top_l(bx * 4 + i);
@@ -520,8 +535,6 @@ begin
                     else
                         tlv := rowr(by - 1)(bx * 4 - 1);
                     end if;
-                    at := by > 0 or mb.avail_b = '1';
-                    al := bx > 0 or mb.avail_a = '1';
                     if by = 0 then
                         if bx < 3 then
                             atr := mb.avail_b = '1';
@@ -544,22 +557,18 @@ begin
                             t8(4 + i) := rowr(by - 1)(bx * 4 + 4 + i);
                         end if;
                     end loop;
-                    pp := pred4x4(to_integer(mb.i4_modes(r)), t8, l4, tlv, at, al);
-                elsif mb.mbtype = MBT_I16 and n < 16 then
-                    for y in 0 to 3 loop
-                        for x in 0 to 3 loop
-                            case to_integer(mb.i16_mode) is
-                                when 0 => v := top_l(bx * 4 + x);
-                                when 1 => v := left_l(by * 4 + y);
-                                when 2 => v := i16_dc;
-                                when others => v := clip1(asr(base4 + pbm(x) + pcm(y), 5));
-                            end case;
-                            pp(y * 4 + x) := v;
-                        end loop;
-                    end loop;
-                elsif mbt_is_intra(mb.mbtype) and mb.mbtype /= MBT_IPCM and n >= 16 then
-                    xo := bx * 4;
-                    yo := by * 4;
+                    p4_t8 <= t8;
+                    p4_l4 <= l4;
+                    p4_tl <= tlv;
+                    p4_at <= by > 0 or mb.avail_b = '1';
+                    p4_al <= bx > 0 or mb.avail_a = '1';
+                    p4_mode <= to_integer(mb.i4_modes(r));
+                else
+                    c := (n - 16) / 4;
+                    b := (n - 16) mod 4;
+                    base4 <= cpl_a(c) + cpbx(c)(b mod 2) + cpcy(c)(b / 2) + 16;
+                    xo := (b mod 2) * 4;
+                    yo := (b / 2) * 4;
                     sumt := top_c(c)(xo) + top_c(c)(xo + 1) + top_c(c)(xo + 2) + top_c(c)(xo + 3);
                     suml := left_c(c)(yo) + left_c(c)(yo + 1) + left_c(c)(yo + 2) + left_c(c)(yo + 3);
                     a_l := mb.avail_a = '1';
@@ -591,10 +600,44 @@ begin
                             s := 128;
                         end if;
                     end if;
+                    p4_cs <= s;
+                end if;
+            end if;
+            -- S5: prediction
+            if pv(4) = '1' then
+                n := pn(4);
+                if n < 16 then
+                    r := blkr(n);
+                    bx := r mod 4;
+                    by := r / 4;
+                else
+                    c := (n - 16) / 4;
+                    b := (n - 16) mod 4;
+                    bx := b mod 2;
+                    by := b / 2;
+                end if;
+                pp := pp4;
+                if mb.mbtype = MBT_I4x4 and n < 16 then
+                    pp := pred4x4(p4_mode, p4_t8, p4_l4, p4_tl, p4_at, p4_al);
+                elsif mb.mbtype = MBT_I16 and n < 16 then
+                    for y in 0 to 3 loop
+                        for x in 0 to 3 loop
+                            case to_integer(mb.i16_mode) is
+                                when 0 => v := top_l(bx * 4 + x);
+                                when 1 => v := left_l(by * 4 + y);
+                                when 2 => v := i16_dc;
+                                when others => v := clip1(asr(base4 + pbm(x) + pcm(y), 5));
+                            end case;
+                            pp(y * 4 + x) := v;
+                        end loop;
+                    end loop;
+                elsif mbt_is_intra(mb.mbtype) and mb.mbtype /= MBT_IPCM and n >= 16 then
+                    xo := bx * 4;
+                    yo := by * 4;
                     for y in 0 to 3 loop
                         for x in 0 to 3 loop
                             case to_integer(mb.chroma_mode) is
-                                when 0 => v := s;
+                                when 0 => v := p4_cs;
                                 when 1 => v := left_c(c)(yo + y);
                                 when 2 => v := top_c(c)(xo + x);
                                 when others => v := clip1(asr(base4 + cpbm(c)(x) + cpcm(c)(y), 5));
@@ -603,21 +646,41 @@ begin
                         end loop;
                     end loop;
                 end if;
+                pred5 <= pp;
+                res5 <= res4;
+            end if;
+            -- S6: residual, clip, write; neighbour registers for the
+            --     following blocks / macroblock
+            if pv(5) = '1' then
+                n := pn(5);
+                if n < 16 then
+                    r := blkr(n);
+                    bx := r mod 4;
+                    by := r / 4;
+                else
+                    c := (n - 16) / 4;
+                    b := (n - 16) mod 4;
+                    bx := b mod 2;
+                    by := b / 2;
+                end if;
                 for i in 0 to 15 loop
                     if mb.mbtype = MBT_IPCM then
-                        pp(i) := pp4(i);
+                        pp(i) := pred5(i);
                     else
-                        pp(i) := clip1(pp(i) + to_integer(res4(i)));
+                        pp(i) := clip1(pred5(i) + to_integer(res5(i)));
                     end if;
+                    word(i * 8 + 7 downto i * 8) := std_logic_vector(to_unsigned(pp(i), 8));
                 end loop;
-                rec5 <= pp;
-                -- neighbour registers for the following blocks / macroblock
+                rw_en <= '1';
+                rw_data <= word;
                 if n < 16 then
+                    rw_addr <= rslot & to_unsigned(r, 5);
                     for i in 0 to 3 loop
                         rowr(by)(bx * 4 + i) <= pp(12 + i);
                         colr(bx)(by * 4 + i) <= pp(i * 4 + 3);
                     end loop;
                 else
+                    rw_addr <= rslot & to_unsigned(n, 5);
                     for i in 0 to 3 loop
                         if by = 1 then
                             crow(c)(bx * 4 + i) <= pp(12 + i);
@@ -626,20 +689,6 @@ begin
                             ccol(c)(by * 4 + i) <= pp(i * 4 + 3);
                         end if;
                     end loop;
-                end if;
-            end if;
-            -- S6: write the block
-            if pv(5) = '1' then
-                n := pn(5);
-                for i in 0 to 15 loop
-                    word(i * 8 + 7 downto i * 8) := std_logic_vector(to_unsigned(rec5(i), 8));
-                end loop;
-                rw_en <= '1';
-                rw_data <= word;
-                if n < 16 then
-                    rw_addr <= rslot & to_unsigned(blkr(n), 5);
-                else
-                    rw_addr <= rslot & to_unsigned(n, 5);
                 end if;
             end if;
 
@@ -657,6 +706,7 @@ begin
                 pr_blk <= (others => '0');
                 pv <= (others => '0');
                 issue <= 0;
+                gap <= 0;
             else
                 case st is
                     when R_IDLE =>
@@ -690,6 +740,10 @@ begin
 
                     when R_LB0 =>
                         lb_ra <= mb.mb_x + 1;
+                        for i in 0 to 15 loop
+                            scl_l(i) <= dq_v(qrem_l, i) * 2 ** qdiv_l;
+                            scl_c(i) <= dq_v(qrem_c, i) * 2 ** qdiv_c;
+                        end loop;
                         st <= R_LB1;
                     when R_LB1 =>
                         if reload = '1' then
@@ -719,51 +773,34 @@ begin
                                 dcl(i) <= (others => '0');
                             end if;
                         end loop;
-                        -- Intra16x16 DC / plane, chroma plane parameters
+                        -- Intra16x16 DC sums, plane gradient terms
                         sumt := 0;
                         suml := 0;
                         for i in 0 to 15 loop
                             sumt := sumt + top_l(i);
                             suml := suml + left_l(i);
                         end loop;
-                        if mb.avail_a = '1' and mb.avail_b = '1' then
-                            i16_dc <= (sumt + suml + 16) / 32;
-                        elsif mb.avail_a = '1' then
-                            i16_dc <= (suml + 8) / 16;
-                        elsif mb.avail_b = '1' then
-                            i16_dc <= (sumt + 8) / 16;
-                        else
-                            i16_dc <= 128;
-                        end if;
-                        h := 0;
-                        vv := 0;
+                        sum_t <= sumt;
+                        sum_l <= suml;
                         for i in 0 to 7 loop
                             if i = 7 then
-                                h := h + (i + 1) * (top_l(8 + i) - tl_l);
-                                vv := vv + (i + 1) * (left_l(8 + i) - tl_l);
+                                wh(i) <= (i + 1) * (top_l(8 + i) - tl_l);
+                                wv(i) <= (i + 1) * (left_l(8 + i) - tl_l);
                             else
-                                h := h + (i + 1) * (top_l(8 + i) - top_l(6 - i));
-                                vv := vv + (i + 1) * (left_l(8 + i) - left_l(6 - i));
+                                wh(i) <= (i + 1) * (top_l(8 + i) - top_l(6 - i));
+                                wv(i) <= (i + 1) * (left_l(8 + i) - left_l(6 - i));
                             end if;
                         end loop;
-                        pl_a <= 16 * (left_l(15) + top_l(15));
-                        pl_b <= asr(5 * h + 32, 6);
-                        pl_c <= asr(5 * vv + 32, 6);
                         for c2 in 0 to 1 loop
-                            h := 0;
-                            vv := 0;
                             for i in 0 to 3 loop
                                 if i = 3 then
-                                    h := h + (i + 1) * (top_c(c2)(4 + i) - tl_c(c2));
-                                    vv := vv + (i + 1) * (left_c(c2)(4 + i) - tl_c(c2));
+                                    cwh(c2)(i) <= (i + 1) * (top_c(c2)(4 + i) - tl_c(c2));
+                                    cwv(c2)(i) <= (i + 1) * (left_c(c2)(4 + i) - tl_c(c2));
                                 else
-                                    h := h + (i + 1) * (top_c(c2)(4 + i) - top_c(c2)(2 - i));
-                                    vv := vv + (i + 1) * (left_c(c2)(4 + i) - left_c(c2)(2 - i));
+                                    cwh(c2)(i) <= (i + 1) * (top_c(c2)(4 + i) - top_c(c2)(2 - i));
+                                    cwv(c2)(i) <= (i + 1) * (left_c(c2)(4 + i) - left_c(c2)(2 - i));
                                 end if;
                             end loop;
-                            cpl_a(c2) <= 16 * (left_c(c2)(7) + top_c(c2)(7));
-                            cpl_b(c2) <= asr(34 * h + 32, 6);
-                            cpl_c(c2) <= asr(34 * vv + 32, 6);
                         end loop;
                         st <= R_DC3;
                     when R_DC3 =>
@@ -774,6 +811,59 @@ begin
                                 dcc(i) <= (others => '0');
                             end if;
                         end loop;
+                        if mb.avail_a = '1' and mb.avail_b = '1' then
+                            i16_dc <= (sum_t + sum_l + 16) / 32;
+                        elsif mb.avail_a = '1' then
+                            i16_dc <= (sum_l + 8) / 16;
+                        elsif mb.avail_b = '1' then
+                            i16_dc <= (sum_t + 8) / 16;
+                        else
+                            i16_dc <= 128;
+                        end if;
+                        h := 0;
+                        vv := 0;
+                        for i in 0 to 7 loop
+                            h := h + wh(i);
+                            vv := vv + wv(i);
+                        end loop;
+                        h_r <= h;
+                        v_r <= vv;
+                        for c2 in 0 to 1 loop
+                            ch_r(c2) <= cwh(c2)(0) + cwh(c2)(1) + cwh(c2)(2) + cwh(c2)(3);
+                            cv_r(c2) <= cwv(c2)(0) + cwv(c2)(1) + cwv(c2)(2) + cwv(c2)(3);
+                        end loop;
+                        -- luma DC: rows of the 4x4 Hadamard
+                        for i in 0 to 3 loop
+                            tmp_r(i * 4) <= dcl(i * 4) + dcl(i * 4 + 1) + dcl(i * 4 + 2) + dcl(i * 4 + 3);
+                            tmp_r(i * 4 + 1) <= dcl(i * 4) + dcl(i * 4 + 1) - dcl(i * 4 + 2) - dcl(i * 4 + 3);
+                            tmp_r(i * 4 + 2) <= dcl(i * 4) - dcl(i * 4 + 1) - dcl(i * 4 + 2) + dcl(i * 4 + 3);
+                            tmp_r(i * 4 + 3) <= dcl(i * 4) - dcl(i * 4 + 1) + dcl(i * 4 + 2) - dcl(i * 4 + 3);
+                        end loop;
+                        st <= R_DC4;
+                    when R_DC4 =>
+                        pl_a <= 16 * (left_l(15) + top_l(15));
+                        pl_b <= asr(5 * h_r + 32, 6);
+                        pl_c <= asr(5 * v_r + 32, 6);
+                        for c2 in 0 to 1 loop
+                            cpl_a(c2) <= 16 * (left_c(c2)(7) + top_c(c2)(7));
+                            cpl_b(c2) <= asr(34 * ch_r(c2) + 32, 6);
+                            cpl_c(c2) <= asr(34 * cv_r(c2) + 32, 6);
+                        end loop;
+                        -- luma DC: columns; chroma DC: 2x2 Hadamard per component
+                        for j in 0 to 3 loop
+                            fl(j) <= tmp_r(j) + tmp_r(4 + j) + tmp_r(8 + j) + tmp_r(12 + j);
+                            fl(4 + j) <= tmp_r(j) + tmp_r(4 + j) - tmp_r(8 + j) - tmp_r(12 + j);
+                            fl(8 + j) <= tmp_r(j) - tmp_r(4 + j) - tmp_r(8 + j) + tmp_r(12 + j);
+                            fl(12 + j) <= tmp_r(j) - tmp_r(4 + j) + tmp_r(8 + j) - tmp_r(12 + j);
+                        end loop;
+                        for c2 in 0 to 1 loop
+                            fc(c2 * 4) <= dcc(c2 * 4) + dcc(c2 * 4 + 1) + dcc(c2 * 4 + 2) + dcc(c2 * 4 + 3);
+                            fc(c2 * 4 + 1) <= dcc(c2 * 4) - dcc(c2 * 4 + 1) + dcc(c2 * 4 + 2) - dcc(c2 * 4 + 3);
+                            fc(c2 * 4 + 2) <= dcc(c2 * 4) + dcc(c2 * 4 + 1) - dcc(c2 * 4 + 2) - dcc(c2 * 4 + 3);
+                            fc(c2 * 4 + 3) <= dcc(c2 * 4) - dcc(c2 * 4 + 1) - dcc(c2 * 4 + 2) + dcc(c2 * 4 + 3);
+                        end loop;
+                        st <= R_DC5;
+                    when R_DC5 =>
                         -- products of the plane gradients with the block offsets
                         for i in 0 to 3 loop
                             pbx(i) <= pl_b * (i * 4 - 7);
@@ -791,33 +881,19 @@ begin
                                 cpcm(c2)(i) <= cpl_c(c2) * i;
                             end loop;
                         end loop;
-                        st <= R_DCH1;
-                    when R_DCH1 =>
-                        -- luma DC: 4x4 Hadamard
-                        for i in 0 to 3 loop
-                            tmp(i * 4) := dcl(i * 4) + dcl(i * 4 + 1) + dcl(i * 4 + 2) + dcl(i * 4 + 3);
-                            tmp(i * 4 + 1) := dcl(i * 4) + dcl(i * 4 + 1) - dcl(i * 4 + 2) - dcl(i * 4 + 3);
-                            tmp(i * 4 + 2) := dcl(i * 4) - dcl(i * 4 + 1) - dcl(i * 4 + 2) + dcl(i * 4 + 3);
-                            tmp(i * 4 + 3) := dcl(i * 4) - dcl(i * 4 + 1) + dcl(i * 4 + 2) - dcl(i * 4 + 3);
-                        end loop;
-                        for j in 0 to 3 loop
-                            fl(j) <= tmp(j) + tmp(4 + j) + tmp(8 + j) + tmp(12 + j);
-                            fl(4 + j) <= tmp(j) + tmp(4 + j) - tmp(8 + j) - tmp(12 + j);
-                            fl(8 + j) <= tmp(j) - tmp(4 + j) - tmp(8 + j) + tmp(12 + j);
-                            fl(12 + j) <= tmp(j) - tmp(4 + j) + tmp(8 + j) - tmp(12 + j);
-                        end loop;
-                        -- chroma DC: 2x2 Hadamard per component
-                        for c2 in 0 to 1 loop
-                            fc(c2 * 4) <= dcc(c2 * 4) + dcc(c2 * 4 + 1) + dcc(c2 * 4 + 2) + dcc(c2 * 4 + 3);
-                            fc(c2 * 4 + 1) <= dcc(c2 * 4) - dcc(c2 * 4 + 1) + dcc(c2 * 4 + 2) - dcc(c2 * 4 + 3);
-                            fc(c2 * 4 + 2) <= dcc(c2 * 4) + dcc(c2 * 4 + 1) - dcc(c2 * 4 + 2) - dcc(c2 * 4 + 3);
-                            fc(c2 * 4 + 3) <= dcc(c2 * 4) - dcc(c2 * 4 + 1) - dcc(c2 * 4 + 2) + dcc(c2 * 4 + 3);
-                        end loop;
-                        st <= R_DCH2;
-                    when R_DCH2 =>
+                        -- DC dequantisation products
                         ls := 16 * DEQUANT_TAB(qrem_l * 3);
                         for i in 0 to 15 loop
-                            w64 := resize(resize(fl(i), 28) * to_signed(ls, 12), 40);
+                            prod_l(i) <= resize(resize(fl(i), 28) * to_signed(ls, 12), 40);
+                        end loop;
+                        ls := 16 * DEQUANT_TAB(qrem_c * 3);
+                        for i in 0 to 7 loop
+                            prod_c(i) <= resize(resize(fc(i), 28) * to_signed(ls, 12), 40);
+                        end loop;
+                        st <= R_DC6;
+                    when R_DC6 =>
+                        for i in 0 to 15 loop
+                            w64 := prod_l(i);
                             if qdiv_l >= 6 then
                                 w64 := shift_left(w64, qdiv_l - 6);
                             else
@@ -825,13 +901,12 @@ begin
                             end if;
                             ldc(i) <= resize(w64, 20);
                         end loop;
-                        ls := 16 * DEQUANT_TAB(qrem_c * 3);
                         for i in 0 to 7 loop
-                            w64 := resize(resize(fc(i), 28) * to_signed(ls, 12), 40);
-                            w64 := shift_right(shift_left(w64, qdiv_c), 5);
+                            w64 := shift_right(shift_left(prod_c(i), qdiv_c), 5);
                             cdc(i) <= resize(w64, 20);
                         end loop;
                         issue <= 0;
+                        gap <= 0;
                         st <= R_RUN;
 
                     when R_RUN =>

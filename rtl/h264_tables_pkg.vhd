@@ -165,33 +165,48 @@ end package h264_tables_pkg;
 
 package body h264_tables_pkg is
 
+    -- All leading zero counts are evaluated in parallel: candidate k reads
+    -- the s_bits after a leading one at position k (fixed bit positions, no
+    -- shifter) from its part of the ROM; exactly one candidate is selected
+    -- (k = lzmax also covers more leading zeros).
     function vlc_lookup(rom : int_array_t; s_bits : natural; lzmax : natural;
                         tab : natural; b : std_logic_vector(15 downto 0)) return natural is
-        variable lz  : natural range 0 to 16;
-        variable suf : natural;
-        variable p   : integer;
+        variable acc  : unsigned(15 downto 0);
+        variable hit  : boolean;
+        variable zpfx : boolean;
+        variable suf  : natural;
+        variable m    : unsigned(15 downto 0);
     begin
-        lz := 16;
-        for i in 15 downto 0 loop
-            if b(i) = '1' then
-                lz := 15 - i;
-                exit;
-            end if;
-        end loop;
-        if lz > lzmax then
-            lz := lzmax;
-        end if;
-        suf := 0;
-        for k in 1 to s_bits loop
-            p := 15 - lz - k;
-            suf := suf * 2;
-            if p >= 0 then
-                if b(p) = '1' then
-                    suf := suf + 1;
+        acc := (others => '0');
+        for k in 0 to lzmax loop
+            zpfx := true;
+            for i in 0 to k - 1 loop
+                if b(15 - i) = '1' then
+                    zpfx := false;
                 end if;
+            end loop;
+            if k < lzmax then
+                hit := zpfx and b(15 - k) = '1';
+            else
+                hit := zpfx;
             end if;
+            suf := 0;
+            for j in 1 to s_bits loop
+                suf := suf * 2;
+                if 15 - k - j >= 0 then
+                    if b(15 - k - j) = '1' then
+                        suf := suf + 1;
+                    end if;
+                end if;
+            end loop;
+            if hit then
+                m := (others => '1');
+            else
+                m := (others => '0');
+            end if;
+            acc := acc or (to_unsigned(rom(tab * (lzmax + 1) * (2 ** s_bits) + k * (2 ** s_bits) + suf), 16) and m);
         end loop;
-        return rom(tab * (lzmax + 1) * (2 ** s_bits) + lz * (2 ** s_bits) + suf);
+        return to_integer(acc);
     end function;
 
 end package body h264_tables_pkg;

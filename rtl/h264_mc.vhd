@@ -11,6 +11,11 @@
 --   macroblock; intra macroblocks pass through.
 --   The first macroblock of a picture waits until the deblocking stage has
 --   finished writing all previous pictures.
+--   Pipelining: job parameters come from a 3 stage generator (one per
+--   side: fetch / read data) that prepares the next job while the current
+--   one runs; window rows are aligned, then horizontally filtered; output
+--   rows take two stages (vertical taps / products, then rounding, clipping
+--   and the quarter sample averages).
 -- ============================================================================
 library ieee;
 use ieee.std_logic_1164.all;
@@ -60,6 +65,7 @@ architecture rtl of h264_mc is
     type b1_row_t is array (0 to 15) of b1_t;
     type b1_arr_t is array (0 to 5) of b1_row_t;
     type bytes32_t is array (0 to 31) of pix_t;
+    type xs_arr_t is array (0 to 20) of natural range 0 to 31;
 
     -- partition list
     type part_t is record
@@ -85,7 +91,23 @@ architecture rtl of h264_mc is
         first  : natural range 0 to 2047;         -- first fetched column
         abase  : natural range 0 to 2047;         -- 8 byte aligned fetch start
         nwords : natural range 1 to 4;
+        xs     : xs_arr_t;                        -- fetched byte of window column c
+        mode   : natural range 0 to 63;           -- luma: fy * 4 + fx
+        w00, w01, w10, w11 : natural range 0 to 64;   -- chroma bilinear weights
     end record;
+    constant JOB_INIT : job_t := (plane => 0, fb => (others => '0'), x0 => 0, y0 => 0, ww => 0, wh => 0,
+                                  fx => 0, fy => 0, px => 0, py => 0, w => 0, h => 0, wp => 0, hp => 0,
+                                  first => 0, abase => 0, nwords => 1, xs => (others => 0), mode => 0,
+                                  w00 => 0, w01 => 0, w10 => 0, w11 => 0);
+
+    -- generator stage 1: partition, motion vector, reference
+    type jp1_t is record
+        p     : part_t;
+        plane : natural range 0 to 2;
+        mv    : mv_t;
+        fb    : unsigned(4 downto 0);
+    end record;
+    constant JP1_INIT : jp1_t := (p => (0, 0, 0, 0), plane => 0, mv => MV_ZERO, fb => (others => '0'));
 
     function clipi(lo, hi, v : integer) return integer is
     begin
@@ -102,16 +124,26 @@ architecture rtl of h264_mc is
         return to_integer(shift_right(to_signed(v, 32), n));
     end function;
 
-    function job_params(mb : mbinfo_t; pl : plist_t; j : natural) return job_t is
+    function jp_stage1(mb : mbinfo_t; pl : plist_t; part : natural; plane : natural) return jp1_t is
+        variable g : jp1_t;
+    begin
+        g.p := pl(part);
+        g.plane := plane;
+        g.mv := mb.mv(g.p.y4 * 4 + g.p.x4);
+        g.fb := mb.refpic((g.p.y4 / 2) * 2 + g.p.x4 / 2);
+        return g;
+    end function;
+
+    function jp_stage2(mb : mbinfo_t; g : jp1_t) return job_t is
         variable jb   : job_t;
         variable p    : part_t;
         variable mv   : mv_t;
-        variable last : integer;
     begin
-        p := pl(j / 3);
-        jb.plane := j mod 3;
-        mv := mb.mv(p.y4 * 4 + p.x4);
-        jb.fb := mb.refpic((p.y4 / 2) * 2 + p.x4 / 2);
+        jb := JOB_INIT;
+        p := g.p;
+        mv := g.mv;
+        jb.plane := g.plane;
+        jb.fb := g.fb;
         if jb.plane = 0 then
             jb.x0 := to_integer(mb.mb_x) * 16 + p.x4 * 4 + floordiv(to_integer(mv.x), 2) - 2;
             jb.y0 := to_integer(mb.mb_y) * 16 + p.y4 * 4 + floordiv(to_integer(mv.y), 2) - 2;
@@ -139,10 +171,31 @@ architecture rtl of h264_mc is
             jb.wp := to_integer(mb.pic_w) * 8;
             jb.hp := to_integer(mb.pic_h) * 8;
         end if;
+        return jb;
+    end function;
+
+    function jp_stage3(j : job_t) return job_t is
+        variable jb   : job_t;
+        variable last : integer;
+        variable xs   : integer;
+    begin
+        jb := j;
         jb.first := clipi(0, jb.wp - 1, jb.x0);
         last := clipi(0, jb.wp - 1, jb.x0 + jb.ww - 1);
         jb.abase := (jb.first / 8) * 8;
         jb.nwords := last / 8 - jb.first / 8 + 1;
+        for c in 0 to 20 loop
+            xs := clipi(0, jb.wp - 1, jb.x0 + c) - jb.abase;
+            if xs < 0 or xs > 31 then
+                xs := 0;
+            end if;
+            jb.xs(c) := xs;
+        end loop;
+        jb.mode := jb.fy * 4 + jb.fx;
+        jb.w00 := (8 - jb.fx) * (8 - jb.fy);
+        jb.w01 := jb.fx * (8 - jb.fy);
+        jb.w10 := (8 - jb.fx) * jb.fy;
+        jb.w11 := jb.fx * jb.fy;
         return jb;
     end function;
 
@@ -176,19 +229,34 @@ architecture rtl of h264_mc is
     signal tok_v    : std_logic;
     signal run      : std_logic;         -- jobs of the current MB active
 
+    -- job parameter generators (fetch side f_*, read data side d_*):
+    -- stage 1 / 2 registers, next job, current job
+    signal f_gpart, d_gpart   : natural range 0 to 16;
+    signal f_gplane, d_gplane : natural range 0 to 2;
+    signal f_gcnt, d_gcnt     : natural range 0 to 48;
+    signal f_g1, d_g1         : jp1_t;
+    signal f_g1v, d_g1v       : std_logic;
+    signal f_g2, d_g2         : job_t;
+    signal f_g2v, d_g2v       : std_logic;
+    signal f_nxt, d_nxt       : job_t;
+    signal f_nxt_v, d_nxt_v   : std_logic;
+    signal f_cur, d_cur       : job_t;
+    signal f_cur_v, d_cur_v   : std_logic;
     -- fetch
-    signal f_job    : natural range 0 to 48;
     signal f_row    : natural range 0 to 21;
-    signal f_jb     : job_t;
-    signal f_jbv    : std_logic;
     signal arvalid  : std_logic;
     signal araddr   : unsigned(31 downto 0);
     signal arlen    : unsigned(7 downto 0);
     signal outstanding : natural range 0 to 63;
 
     -- data path
-    signal d_job    : natural range 0 to 48;
     signal d_row    : natural range 0 to 21;
+    -- aligned row (stage A)
+    signal row_a    : win_row_t;
+    signal va       : std_logic;
+    signal idx_a    : natural range 0 to 21;
+    signal jb_a     : job_t;
+    signal last_a   : std_logic;
     signal d_beat   : natural range 0 to 3;
     signal rowbuf   : bytes32_t;
     signal row_v    : std_logic;          -- aligned window row available
@@ -203,6 +271,19 @@ architecture rtl of h264_mc is
     signal o_y      : natural range 0 to 15;
     signal o_jb     : job_t;
     signal o_last   : std_logic;
+    -- output row stage 2
+    type pix16_t is array (0 to 15) of pix_t;
+    type tapv_t is array (0 to 15) of integer range -8192 to 16383;
+    type tapj_t is array (0 to 15) of integer range -2097152 to 2097151;
+    type prod_t is array (0 to 15) of natural range 0 to 16383;
+    signal q_v      : std_logic;
+    signal q_y      : natural range 0 to 15;
+    signal q_jb     : job_t;
+    signal q_last   : std_logic;
+    signal q_gg, q_hh, q_mm, q_bh, q_sv : pix16_t;
+    signal q_h1, q_m1 : tapv_t;
+    signal q_j1     : tapj_t;
+    signal q_c0, q_c1 : prod_t;            -- chroma: w00*a + w01*b, w10*c + w11*d
     signal jobs_done : natural range 0 to 48;
     signal row_consumed : std_logic;
 begin
@@ -343,15 +424,21 @@ begin
         variable a   : unsigned(31 downto 0);
         variable jb  : job_t;
         variable issued, retired : boolean;
+        variable take : boolean;
     begin
         if rising_edge(clk) then
             issued := false;
             retired := row_consumed = '1';
             if rst = '1' or run = '0' then
                 arvalid <= '0';
-                f_job <= 0;
                 f_row <= 0;
-                f_jbv <= '0';
+                f_gpart <= 0;
+                f_gplane <= 0;
+                f_gcnt <= 0;
+                f_g1v <= '0';
+                f_g2v <= '0';
+                f_nxt_v <= '0';
+                f_cur_v <= '0';
                 if rst = '1' then
                     outstanding <= 0;
                 end if;
@@ -359,14 +446,9 @@ begin
                 if arvalid = '1' and m_arready = '1' then
                     arvalid <= '0';
                 end if;
-                if f_jbv = '0' then
-                    if f_job < njobs then
-                        f_jb <= job_params(mb, pl, f_job);
-                        f_jbv <= '1';
-                        f_row <= 0;
-                    end if;
-                elsif (arvalid = '0' or m_arready = '1') and outstanding < 24 then
-                    jb := f_jb;
+                take := f_cur_v = '0';
+                if f_cur_v = '1' and (arvalid = '0' or m_arready = '1') and outstanding < 24 then
+                    jb := f_cur;
                     y := clipi(0, jb.hp - 1, jb.y0 + f_row);
                     a := fb_plane_addr(unsigned(G_FB_BASE), jb.fb, jb.plane,
                                        to_unsigned(jb.abase, 11), to_unsigned(y, 11));
@@ -375,10 +457,40 @@ begin
                     arvalid <= '1';
                     issued := true;
                     if f_row = jb.wh - 1 then
-                        f_jbv <= '0';
-                        f_job <= f_job + 1;
+                        f_row <= 0;
+                        take := true;
                     else
                         f_row <= f_row + 1;
+                    end if;
+                end if;
+                -- job parameter generator (one job in flight, next job slot)
+                if f_g2v = '1' then
+                    f_nxt <= jp_stage3(f_g2);
+                    f_nxt_v <= '1';
+                end if;
+                f_g2v <= f_g1v;
+                if f_g1v = '1' then
+                    f_g2 <= jp_stage2(mb, f_g1);
+                end if;
+                f_g1v <= '0';
+                if f_gcnt < njobs and f_g1v = '0' and f_g2v = '0' and (f_nxt_v = '0' or take) then
+                    f_g1 <= jp_stage1(mb, pl, f_gpart, f_gplane);
+                    f_g1v <= '1';
+                    f_gcnt <= f_gcnt + 1;
+                    if f_gplane = 2 then
+                        f_gplane <= 0;
+                        f_gpart <= f_gpart + 1;
+                    else
+                        f_gplane <= f_gplane + 1;
+                    end if;
+                end if;
+                if take then
+                    if f_nxt_v = '1' then
+                        f_cur <= f_nxt;
+                        f_cur_v <= '1';
+                        f_nxt_v <= '0';
+                    else
+                        f_cur_v <= '0';
                     end if;
                 end if;
             end if;
@@ -393,56 +505,102 @@ begin
     end process;
 
     -- ------------------------------------------------------------------
-    -- read data: assemble window rows
+    -- read data: assemble window rows (A: align and clamp, B: horizontal
+    -- 6-tap of the aligned row)
     -- ------------------------------------------------------------------
     process (clk)
         variable rb  : bytes32_t;
         variable wr  : win_row_t;
-        variable xs  : integer;
         variable jb  : job_t;
+        variable take : boolean;
     begin
         if rising_edge(clk) then
+            va <= '0';
             row_v <= '0';
             row_consumed <= '0';
+            -- stage B
+            if va = '1' then
+                row_d <= row_a;
+                for x in 0 to 15 loop
+                    row_b1(x) <= tap6(row_a(x), row_a(x + 1), row_a(x + 2), row_a(x + 3), row_a(x + 4), row_a(x + 5));
+                end loop;
+                row_v <= '1';
+                row_idx <= idx_a;
+                row_jb <= jb_a;
+                row_last <= last_a;
+            end if;
             if rst = '1' or run = '0' then
-                d_job <= 0;
                 d_row <= 0;
                 d_beat <= 0;
+                d_gpart <= 0;
+                d_gplane <= 0;
+                d_gcnt <= 0;
+                d_g1v <= '0';
+                d_g2v <= '0';
+                d_nxt_v <= '0';
+                d_cur_v <= '0';
             else
+                take := d_cur_v = '0';
                 if m_rvalid = '1' then
+                    -- synthesis translate_off
+                    assert d_cur_v = '1' report "mc: read data without job parameters" severity failure;
+                    -- synthesis translate_on
                     rb := rowbuf;
                     for i in 0 to 7 loop
                         rb(d_beat * 8 + i) := to_integer(unsigned(m_rdata(i * 8 + 7 downto i * 8)));
                     end loop;
                     rowbuf <= rb;
-                    jb := job_params(mb, pl, d_job);
+                    jb := d_cur;
                     if d_beat = jb.nwords - 1 then
-                        -- complete row: align and clamp
+                        -- stage A: complete row, align and clamp
                         for c in 0 to 20 loop
-                            xs := clipi(0, jb.wp - 1, jb.x0 + c) - jb.abase;
-                            if xs < 0 or xs > 31 then
-                                xs := 0;
-                            end if;
-                            wr(c) := rb(xs);
+                            wr(c) := rb(jb.xs(c));
                         end loop;
-                        row_d <= wr;
-                        for x in 0 to 15 loop
-                            row_b1(x) <= tap6(wr(x), wr(x + 1), wr(x + 2), wr(x + 3), wr(x + 4), wr(x + 5));
-                        end loop;
-                        row_v <= '1';
-                        row_idx <= d_row;
-                        row_jb <= jb;
-                        row_last <= to_sl(d_row = jb.wh - 1);
+                        row_a <= wr;
+                        va <= '1';
+                        idx_a <= d_row;
+                        jb_a <= jb;
+                        last_a <= to_sl(d_row = jb.wh - 1);
                         row_consumed <= '1';
                         d_beat <= 0;
                         if d_row = jb.wh - 1 then
                             d_row <= 0;
-                            d_job <= d_job + 1;
+                            take := true;
                         else
                             d_row <= d_row + 1;
                         end if;
                     else
                         d_beat <= d_beat + 1;
+                    end if;
+                end if;
+                -- job parameter generator
+                if d_g2v = '1' then
+                    d_nxt <= jp_stage3(d_g2);
+                    d_nxt_v <= '1';
+                end if;
+                d_g2v <= d_g1v;
+                if d_g1v = '1' then
+                    d_g2 <= jp_stage2(mb, d_g1);
+                end if;
+                d_g1v <= '0';
+                if d_gcnt < njobs and d_g1v = '0' and d_g2v = '0' and (d_nxt_v = '0' or take) then
+                    d_g1 <= jp_stage1(mb, pl, d_gpart, d_gplane);
+                    d_g1v <= '1';
+                    d_gcnt <= d_gcnt + 1;
+                    if d_gplane = 2 then
+                        d_gplane <= 0;
+                        d_gpart <= d_gpart + 1;
+                    else
+                        d_gplane <= d_gplane + 1;
+                    end if;
+                end if;
+                if take then
+                    if d_nxt_v = '1' then
+                        d_cur <= d_nxt;
+                        d_cur_v <= '1';
+                        d_nxt_v <= '0';
+                    else
+                        d_cur_v <= '0';
                     end if;
                 end if;
             end if;
@@ -454,13 +612,11 @@ begin
     -- ------------------------------------------------------------------
     process (clk)
         variable jb      : job_t;
-        variable gg, hh, mm, bb, ss, h1v, m1v, j1v : integer;
+        variable gg, hh, mm : integer;
         variable bh, hv, mv2, jv, sv : integer;
         variable v       : integer;
         variable word    : std_logic_vector(127 downto 0);
         variable en      : std_logic_vector(15 downto 0);
-        variable xa, ya  : integer;
-        variable aa, b2, cc, dd : integer;
         variable bank    : integer;
     begin
         if rising_edge(clk) then
@@ -468,6 +624,7 @@ begin
             o_v <= '0';
             if rst = '1' or run = '0' then
                 jobs_done <= 0;
+                q_v <= '0';
             else
                 -- shift a new row in
                 if row_v = '1' then
@@ -491,26 +648,47 @@ begin
                         end if;
                     end if;
                 end if;
-                -- produce one prediction row
+                -- output stage 1: vertical taps, half sample terms, chroma products
+                q_v <= o_v;
                 if o_v = '1' then
                     jb := o_jb;
+                    q_jb <= o_jb;
+                    q_y <= o_y;
+                    q_last <= o_last;
+                    for x in 0 to 15 loop
+                        if jb.plane = 0 then
+                            q_gg(x) <= win(2)(x + 2);
+                            q_hh(x) <= win(2)(x + 3);
+                            q_mm(x) <= win(3)(x + 2);
+                            q_bh(x) <= clip1(floordiv(b1s(2)(x) + 16, 5));
+                            q_sv(x) <= clip1(floordiv(b1s(3)(x) + 16, 5));
+                            q_h1(x) <= tap6(win(0)(x + 2), win(1)(x + 2), win(2)(x + 2), win(3)(x + 2), win(4)(x + 2), win(5)(x + 2));
+                            q_m1(x) <= tap6(win(0)(x + 3), win(1)(x + 3), win(2)(x + 3), win(3)(x + 3), win(4)(x + 3), win(5)(x + 3));
+                            q_j1(x) <= tap6(b1s(0)(x), b1s(1)(x), b1s(2)(x), b1s(3)(x), b1s(4)(x), b1s(5)(x));
+                        else
+                            -- chroma: rows win(4) (y) and win(5) (y+1)
+                            q_c0(x) <= jb.w00 * win(4)(x) + jb.w01 * win(4)(x + 1);
+                            q_c1(x) <= jb.w10 * win(5)(x) + jb.w11 * win(5)(x + 1);
+                        end if;
+                    end loop;
+                end if;
+                -- output stage 2: rounding, clipping, averages, write
+                if q_v = '1' then
+                    jb := q_jb;
                     word := (others => '0');
                     en := (others => '0');
                     for x in 0 to 15 loop
                         if x < jb.w then
                             if jb.plane = 0 then
-                                gg := win(2)(x + 2);
-                                hh := win(2)(x + 3);
-                                mm := win(3)(x + 2);
-                                bh := clip1(floordiv(b1s(2)(x) + 16, 5));
-                                sv := clip1(floordiv(b1s(3)(x) + 16, 5));
-                                h1v := tap6(win(0)(x + 2), win(1)(x + 2), win(2)(x + 2), win(3)(x + 2), win(4)(x + 2), win(5)(x + 2));
-                                m1v := tap6(win(0)(x + 3), win(1)(x + 3), win(2)(x + 3), win(3)(x + 3), win(4)(x + 3), win(5)(x + 3));
-                                j1v := tap6(b1s(0)(x), b1s(1)(x), b1s(2)(x), b1s(3)(x), b1s(4)(x), b1s(5)(x));
-                                hv := clip1(floordiv(h1v + 16, 5));
-                                mv2 := clip1(floordiv(m1v + 16, 5));
-                                jv := clip1(floordiv(j1v + 512, 10));
-                                case jb.fy * 4 + jb.fx is
+                                gg := q_gg(x);
+                                hh := q_hh(x);
+                                mm := q_mm(x);
+                                bh := q_bh(x);
+                                sv := q_sv(x);
+                                hv := clip1(floordiv(q_h1(x) + 16, 5));
+                                mv2 := clip1(floordiv(q_m1(x) + 16, 5));
+                                jv := clip1(floordiv(q_j1(x) + 512, 10));
+                                case jb.mode is
                                     when 0 => v := gg;
                                     when 1 => v := (gg + bh + 1) / 2;
                                     when 2 => v := bh;
@@ -530,13 +708,7 @@ begin
                                 end case;
                                 bank := jb.px + x;
                             else
-                                -- chroma: rows win(4) (y) and win(5) (y+1)
-                                aa := win(4)(x);
-                                b2 := win(4)(x + 1);
-                                cc := win(5)(x);
-                                dd := win(5)(x + 1);
-                                v := ((8 - jb.fx) * (8 - jb.fy) * aa + jb.fx * (8 - jb.fy) * b2 +
-                                      (8 - jb.fx) * jb.fy * cc + jb.fx * jb.fy * dd + 32) / 64;
+                                v := (q_c0(x) + q_c1(x) + 32) / 64;
                                 bank := (jb.plane - 1) * 8 + jb.px + x;
                             end if;
                             if bank <= 15 then
@@ -548,11 +720,11 @@ begin
                     pw_en <= en;
                     pw_data <= word;
                     if jb.plane = 0 then
-                        pw_addr <= mb.pred_slot & to_unsigned(jb.py + o_y, 5);
+                        pw_addr <= mb.pred_slot & to_unsigned(jb.py + q_y, 5);
                     else
-                        pw_addr <= mb.pred_slot & to_unsigned(16 + jb.py + o_y, 5);
+                        pw_addr <= mb.pred_slot & to_unsigned(16 + jb.py + q_y, 5);
                     end if;
-                    if o_last = '1' then
+                    if q_last = '1' then
                         jobs_done <= jobs_done + 1;
                     end if;
                 end if;
