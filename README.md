@@ -63,13 +63,13 @@ MB'ler üzerinde paralel çalışır.
 | `rtl/h264_pkg.vhd` | Ortak tipler, MB token kaydı (`mbinfo_t`), slice kaydı, Exp-Golomb, çerçeve adres fonksiyonu |
 | `rtl/h264_tables_pkg.vhd` | **Üretilmiş** tablolar (VLC ROM'ları, CBP, zigzag, niceleme, alpha/beta/tC0). `scripts/gen_tables.py` |
 | `rtl/h264_nal.vhd` | Start code bulma, emulation prevention baytı silme, NAL ilk/son bayt işaretleri |
-| `rtl/h264_bitreader.vhd` | 72 bitlik tampon, 64 bit pencere, `more_rbsp_data()`, kayıtlı tüketim |
+| `rtl/h264_bitreader.vhd` | 72 bitlik tampon, 64 bit pencere, `more_rbsp_data()`; bayt ekleme kararı o çevrimin tüketiminden bağımsız (kısa yol) |
 | `rtl/h264_hdr.vhd` | SPS/PPS tabloları (blok RAM), slice header, çerçeve tamponu tahsisi, referans işaretleme (sliding window, MMCO), referans listesi kurulumu ve modifikasyonu, çerçeve çıkış kuyruğu |
-| `rtl/h264_mbparse.vhd` | mb_skip_run, mb_type, Intra4x4 mod tahmini, alt bölütler, ref_idx, MVD + MV tahmini (medyan / yönlü / P_Skip), CBP, QP, CAVLC artıkları, I_PCM, komşu satır tamponu, deblocking bS / QP / filtre bayrakları |
+| `rtl/h264_mbparse.vhd` | mb_skip_run, mb_type, Intra4x4 mod tahmini, alt bölütler, ref_idx, MVD + MV tahmini (medyan / yönlü / P_Skip), CBP, QP, CAVLC artıkları, I_PCM, komşu satır tamponu, deblocking bS / QP / filtre bayrakları. Tüm VLC türleri kayıtlı bir çözme aşamasında paralel çözülür; tüketilecek bit sayısı da orada hesaplanır (sembol başına 2 çevrim) |
 | `rtl/h264_mc.vhd` | Bölüt listesi, satır başına bir AXI okuma patlaması, kenar kırpma, luma 6-tap çeyrek piksel ve kroma 1/8 piksel enterpolasyon (satır akışlı, 16 piksel/çevrim) |
-| `rtl/h264_recon.vhd` | DC Hadamard'lar, ters niceleme, 4x4 tamsayı ters dönüşüm, intra tahminler, PCM, toplama/kırpma |
-| `rtl/h264_deblock.vhd` | 20x20 luma / 12x12 kroma çalışma dizisi, satır-sütun filtre boru hattı (kenar başına bir kademe), satır tamponları, bayt maskeli AXI yazma |
-| `rtl/h264_ram.vhd` | Basit çift portlu RAM (LSRAM/uSRAM çıkarımı), 16 bankalı piksel tamponu |
+| `rtl/h264_recon.vhd` | DC Hadamard'lar, ters niceleme, 4x4 tamsayı ters dönüşüm, intra tahminler, PCM, toplama/kırpma; 4x4 blok başına bir çevrimlik 6 kademeli boru hattı (~40 çevrim/MB) |
+| `rtl/h264_deblock.vhd` | 20x20 luma / 12x12 kroma çalışma dizisi, satır-sütun filtre boru hattı (kenar başına bir kademe), satır tamponları, bayt maskeli AXI yazma (adres kanalı veri kanalının önünde, beat'ler arka arkaya) |
+| `rtl/h264_ram.vhd` | Basit çift portlu RAM (LSRAM/uSRAM çıkarımı, 2 çevrim okuma gecikmesi), 4 şeritli katsayı tamponu, tahmin tamponu |
 | `rtl/h264_dec_top.vhd` | Üst seviye: tüm aşamalar + tek AXI4 master |
 
 Deblocking çıkışı neden kaydırılmış pencere? Bir MB filtrelendiğinde, sağındaki ve altındaki MB'ler
@@ -122,25 +122,40 @@ türleri, gürültülü içerik, çoklu slice, `slice-max-size`, deblocking kapa
 intra + intra refresh, QP 1/10/51, chroma QP ofseti ±, AQ (mb_qp_delta), 16'nın katı olmayan boyutlar
 (kırpma), büyük hareket vektörleri ve çerçeve dışı referanslar, 720p, 1080p.
 
+x264'ün Baseline'da hiç üretmediği özellikler için `scripts/stream_tools.py` sentetik akışlar üretir:
+x264 akışlarının SPS / PPS / slice başlıklarını yeniden yazar (slice verisi bitleri aynen kopyalanır)
+ya da sıfırdan I_PCM akışı oluşturur. Bunlar da standarda uygundur; referans çıktıları yine
+ffmpeg'den alınır (`syn_*` satırları).
+
 Sonuçlar (GHDL 4.1, `STALL=1` rastgele AXI geri basıncı, okuma gecikmesi 12 çevrim):
 
-| Akış | Boyut | Çerçeve | C modeli | RTL (tb_top) | Çevrim/MB |
+| Akış | Boyut | Çerçeve | tb_parse | tb_top (RTL) | Çevrim/MB |
 |---|---|---|---|---|---|
-| qcif_intra | 176x144 | 3 | bit-exact | bit-exact | 293 |
-| qcif_ip | 176x144 | 8 | bit-exact | bit-exact | 300 |
-| qcif_ref3 (tüm bölütler) | 176x144 | 10 | bit-exact | bit-exact | 302 |
-| qcif_noise (QP 20, gürültü) | 176x144 | 6 | bit-exact | bit-exact | 1417 |
-| qcif_slices / slmax | 176x144 | 6 | bit-exact | bit-exact | 303 / 923 |
-| qcif_cip (constrained intra) | 176x144 | 8 | bit-exact | bit-exact | 312 |
-| qcif_nodb / dbofs / dbneg | 176x144 | 6 | bit-exact | bit-exact | 300 |
-| qcif_qp1 / qp10 / qp51 | 176x144 | 3/4/4 | bit-exact | bit-exact | 322 / 1453 / 303 |
-| qcif_cqp / cqpn (chroma QP ofseti, AQ) | 176x144 | 6 | bit-exact | bit-exact | 299 |
-| odd_200x120 / odd_100x60 | kırpmalı | 6 | bit-exact | bit-exact | 298 / 331 |
-| cif_ref4 / cif_bigmv / cif_gop | 352x288 | 10/8/20 | bit-exact | bit-exact | 298 / 289 / 296 |
-| hd720 / hd1080 | 1280x720 / 1920x1080 | 3 / 2 | bit-exact | bkz. not | – |
+| qcif_intra | 176x144 | 3 | bit-exact | bit-exact | 220 |
+| qcif_ip | 176x144 | 8 | bit-exact | bit-exact | 199 |
+| qcif_ref3 (3 referans, tüm bölütler) | 176x144 | 10 | bit-exact | bit-exact | 200 |
+| qcif_noise (QP 20, gürültü) | 176x144 | 6 | bit-exact | bit-exact | 1374 |
+| qcif_slices / slmax | 176x144 | 6/6 | bit-exact | bit-exact | 201 / 918 |
+| qcif_cip (constrained intra) | 176x144 | 8 | bit-exact | bit-exact | 200 |
+| qcif_nodb / dbofs / dbneg | 176x144 | 6/6/6 | bit-exact | bit-exact | 201 / 201 / 201 |
+| qcif_qp1 / qp10 / qp51 | 176x144 | 3/4/4 | bit-exact | bit-exact | 237 / 1415 / 199 |
+| qcif_cqp / cqpn (chroma QP ofseti, AQ) | 176x144 | 6/6 | bit-exact | bit-exact | 199 / 201 |
+| odd_200x120 / odd_100x60 | kırpmalı | 6/6 | bit-exact | bit-exact | 202 / 221 |
+| cif_ref4 / cif_bigmv / cif_gop | 352x288 | 10/8/20 | bit-exact | bit-exact | 195 / 195 / 195 |
+| hd720 / hd1080 | 1280x720 / 1920x1080 | 3/2 | bit-exact / – | bit-exact | 208 / 208 |
+| syn_pcm (I_PCM, P_Skip, slice başına deblock ayarı) | 176x144 | 4 | bit-exact | bit-exact | 386 |
+| syn_r_poc0 / poc1 (POC tip 0 / 1) | 176x144 | 10/10 | bit-exact | bit-exact | 200 / 200 |
+| syn_r_ids (SPS id 7, PPS id 3 / 200) | 176x144 | 10 | bit-exact | bit-exact | 200 |
+| syn_r_reorder (ref_pic_list_modification) | 176x144 | 10 | bit-exact | bit-exact | 200 |
+| syn_r_mmco / mmco_reorder (MMCO 1/2/3/4/6) | 176x144 | 10/10 | bit-exact | bit-exact | 200 / 200 |
+| syn_r_ltidr (uzun dönem IDR) | 176x144 | 10 | bit-exact | bit-exact | 200 |
+| syn_r_ltidr_reorder_poc0_ids (birleşik) | 176x144 | 10 | bit-exact | bit-exact | 200 |
+| syn_c_mmco_reorder | 352x288 | 10 | bit-exact | bit-exact | 195 |
 
-Not: tabloda RTL sonucu henüz yazılmamış satırlar için ayrıştırıcı testbench'i (tb_parse) bit-exact'tir;
-tam çözücü sonuçları README güncellendikçe eklenir.
+32 akışın tamamı tb_top'ta, ayrıştırıcı izleri tb_parse'ta (hd1080 hariç, ayrıştırıcı testi çalıştırılmadı) bit-exact'tir. Ayrıştırıcı testbench'i ayrıca
+iki benzetim iddiası (assertion) içerir: kod çözme aşamasında önceden hesaplanan tüketim miktarı ile
+kullanım aşamasının tükettiği miktar her sembolde aynı olmalı, total_zeros / run_before tablo
+numaraları bayat olmamalı; MC, iş parametreleri hazır olmadan okuma verisi gelirse durur.
 
 ### Çalıştırma
 
@@ -156,42 +171,99 @@ scripts/run_sim.sh top   streams qcif_ip qcif_ref3   # tam RTL ↔ ffmpeg
 `scripts/gen_tables.py`, C modelindeki standart tablolarından `rtl/h264_tables_pkg.vhd`'yi üretir
 ve VLC ROM'larını olası tüm 16 bitlik desenlerle doğrular.
 
-## 6. Performans
+## 6. Performans ve zamanlama
 
-Ölçülen ortalama çevrim/MB değerleri yukarıdaki tablodadır. Tipik akışlarda ~300 çevrim/MB,
-çok yüksek bit hızında (QP ≤ 20, gürültülü içerik) CAVLC'ye bağlı olarak ~1400 çevrim/MB.
+Ölçülen ortalama çevrim/MB değerleri yukarıdaki tablodadır. Tipik akışlarda **~208 çevrim/MB**
+(darboğaz deblocking + çerçeve yazma ile ayrıştırıcı); çok yüksek bit hızlarında CAVLC'ye bağlı olarak
+artar: ayrıştırıcı çevrim başına ~1.4–2 bit işler (qcif_noise: 1913 bit/MB → 1374 çevrim/MB).
+I_PCM'de sınır 8 bit/çevrimlik giriş arayüzüdür (384 bayt/MB → ~380 çevrim/MB).
 
-| Hedef | Gerekli MB/s | 300 çevrim/MB ile gereken saat |
+| Hedef | Gerekli MB/s | 208 çevrim/MB ile gereken saat |
 |---|---|---|
-| 1280x720 @ 30 | 108 000 | 33 MHz |
-| 1920x1080 @ 30 | 244 800 | 74 MHz |
-| 1920x1080 @ 60 | 489 600 | 147 MHz |
+| 1280x720 @ 30 | 108 000 | 22 MHz |
+| 1920x1080 @ 30 | 244 800 | 51 MHz |
+| 1920x1080 @ 60 | 489 600 | 102 MHz |
 
-Kritik yolları kısa tutmak için bit okuyucunun tüketim girişi kayıtlıdır (ayrıştırıcı sembol başına 2
-çevrim). PolarFire'da 100–150 MHz hedeflenir; zamanlama kapanışı Libero'da doğrulanmalıdır.
+Hedef saat **100 MHz**'tir (`libero/h264_dec.sdc`): 1080p'de ~59 fps, 1080p30 için 2 kat pay.
+Ayrıştırıcının CAVLC hızı 100 MHz'te ~140–200 Mbit/s'tir; Baseline seviye 4.x akışları (≤ 20–50 Mbit/s)
+bunun çok altındadır.
+
+Boru hattı (MB başına): mbparse (sembol başına 2 çevrim, VLC tüm türler paralel) → MC (iş parametresi
+üreteci, satır başına bir AXI patlaması, 2 kademeli enterpolasyon) → recon (4x4 blok/çevrim, Intra4x4'te
+blok bağımlılığı nedeniyle 3 çevrimde bir blok) → deblock (kenar başına 2 kademeli filtre, AW kanalı W
+kanalının önünde).
+
+### 6.1 Kaynak ve mantık derinliği tahmini (açık kaynak araçlar)
+
+`scripts/synth_estimate.sh` ile (GHDL `--synth` + yosys `synth_microchip`, PolarFire hücreleri). Derinlik,
+kayıttan kayda en uzun yolun LUT seviyesidir (taşıma zinciri bit başına 0.1 seviye); yönlendirme
+gecikmesi ve modüller arası yollar dahil değildir. Kesin sonuçlar Libero (Synplify Pro + SmartTime)
+raporlarından alınmalıdır.
+
+| Modül | LUT (CFG1–4) | ARI1 | FF (SLE) | LSRAM | MACC | Derinlik (seviye) |
+|---|---|---|---|---|---|---|
+| `h264_nal` | 110 | 32 | 69 | 0 | 0 | 6.0 |
+| `h264_bitreader` | 704 | 48 | 119 | 0 | 0 | 11.0 |
+| `h264_hdr` | 4352 | 458 | 1960 | 3 | 0 | 18.0 |
+| `h264_mbparse` | 9925 | 610 | 3965 | 6 | 5 | 19.5 |
+| `h264_mc` | 14131 | 3902 | 6411 | 0 | 264 | 14.7 |
+| `h264_recon` | 14828 | 3092 | 8720 | 7 | 176 | 16.0 |
+| `h264_predbuf` | 6068 | 6 | 6272 | 0 | 0 | 7.0 |
+| `h264_coefbuf` | 0 | 0 | 0 | 8 | 0 | 0.0 |
+| `h264_deblock` | – | – | – | – | – | filtre kademesi ~10 (bkz. not) |
+
+Not: `h264_deblock` (büyük kayıt dizileri ve çoklayıcılar) yowasp-yosys'in 4 GB bellek sınırına
+sığmadı; yalnızca kenar filtresi kademeleri ayrı bir test varlığıyla ölçüldü (A ve B kademeleri ~10
+seviye, bS / parametre seçimiyle ~13). Kaba tahmin: ~15–20K LUT, ~9K FF, 7 LSRAM (satır tamponları).
+Yosys sabitle çarpmaları da MACC bloklarına eşler; Synplify bunların çoğunu mantıkla gerçekleştirir.
+Toplam (deblock hariç): ~50K LUT + 8K ARI1, ~28K FF, 24 LSRAM. MPFS250T'de 254K LE, 812 LSRAM ve
+784 MACC vardır; çözücü cihazın yaklaşık üçte birini kullanır.
 
 ## 7. MPFS250 Video Kit'e entegrasyon (Libero SoC)
 
-1. `rtl/*.vhd` dosyalarını bir HDL kütüphanesine (work) ekleyin; dil seçeneği VHDL-2008.
-   `h264_dec_top` bir SmartDesign bileşeni olarak eklenir.
-2. Saat: PF_CCC'den tek bir saat (ör. 125–150 MHz). Reset senkron ve aktif-yüksektir
-   (CORERESET_PF çıkışından bu saat alanına senkronlanmış).
-3. Bellek: `m_axi_*` portu çerçeve deposuna bağlanır. Kitte DDR'ın nasıl bağlı olduğuna göre:
-   * fabric tarafı DDR4 varsa **PF_DDR4** IP'sinin AXI4 slave portuna (veri genişliği farklıysa
-     araya **CoreAXI4Interconnect** ile genişlik dönüşümü),
-   * aksi hâlde aynı interconnect üzerinden ekran/kamera yolunun kullandığı bellek denetleyicisine.
-   `G_FB_BASE` bu bellek penceresinde 72 MiB'lık boş bir alanı göstermelidir.
-4. Bit akışı kaynağı: `s_axis_*` arayüzüne herhangi bir fabric kaynağı bağlanabilir (ör. DDR'dan
-   okuyan basit bir DMA, Ethernet/UDP alıcısı, SD kart okuyucu). Akışın son baytında `tlast=1`.
-5. Ekran: `o_frame_valid/index` ile gelen tamponu, kitin HDMI/ekran yolunu besleyen bir çerçeve
-   okuyucusu (YUV420 → RGB/YUV422 dönüşümü ile) okur; okuma bitince `i_release` ile geri verir.
-   Çıkış çerçeve hızını ayarlamak (ör. 30 fps) tüketicinin görevidir; tüketici tamponu tutarken
-   çözücü yeni tamponu kullanamaz, en fazla 18 tampon döngüdedir.
-6. `o_error` ve `o_pic_count` hata ayıklama için bir LED'e / SmartDebug'a bağlanabilir.
+Kitteki aygıt **MPFS250TS-1FCG1152I**'dır (-1 hız sınıfı). Kitte 4 GB DDR4 (x64) ve 2 GB LPDDR4 (x32)
+bulunur; MSS DDR denetleyicisi en fazla 32 bit (+ECC) genişliği desteklediği için x64 DDR4'ün
+fabric DDR denetleyicisine (**PF_DDR4**) bağlı olması beklenir. Bağlantıyı kitin kullanım kılavuzu /
+şemasından doğrulayın. Çözücünün yalnızca FPGA kaynaklarıyla çalışması için çerçeve deposu bu
+fabric DDR4'te tutulmalıdır (MSS ve RISC-V çekirdekleri kullanılmaz).
 
-Tahmini bellek kullanımı: satır tamponları + MB tamponları + SPS/PPS tabloları ≈ 250 Kbit
-(birkaç düzine LSRAM; MPFS250'de 812 LSRAM vardır). Mantık kullanımı Libero sentez raporundan
-alınmalıdır.
+### 7.1 Tek başına sentez (kaynak/zamanlama kontrolü)
+
+```sh
+libero SCRIPT:libero/create_project.tcl SCRIPT_ARGS:"./h264_dec_prj"
+```
+
+Betik bir PolarFire SoC projesi oluşturur (`MPFS250TS`, `FCG1152`, `-1`, endüstriyel; kartınızdaki
+aygıtla karşılaştırıp gerekirse dosyanın başındaki değişkenleri düzeltin), `rtl/*.vhd` dosyalarını VHDL-2008 olarak ekler,
+`h264_dec_top`'u kök yapar, `libero/h264_dec.sdc`'yi (100 MHz) sentez, yerleştirme ve zamanlama
+araçlarına bağlar ve sentezi çalıştırır. Zamanlamayı SmartTime ile kontrol edin; kapanmazsa SDC'deki
+periyodu 13.333 ns'ye (75 MHz) çekin, 1080p30 yine karşılanır. Gerekli saat hızı bölüm 6'dadır.
+
+### 7.2 SmartDesign'a ekleme
+
+1. `rtl/*.vhd` dosyalarını `work` kütüphanesine ekleyin (Project Settings → VHDL: VHDL-2008),
+   `h264_dec_top`'u SmartDesign'a sürükleyin.
+2. Saat: PF_CCC'den tek saat (100 MHz; bkz. bölüm 6). Reset senkron ve aktif-yüksektir; CORERESET_PF
+   çıkışını bu saat alanına senkronlayıp (aktif-düşükse tersleyerek) `rst`'ye bağlayın.
+3. Bellek: `m_axi_*` (AXI4, 64 bit veri, 32 bit adres, ID 4 bit) → **CoreAXI4Interconnect** →
+   PF_DDR4 AXI4 slave portu. PF_DDR4'ün kullanıcı AXI genişliği 64 bitten farklıysa interconnect
+   genişlik dönüşümünü yapar; saat alanları farklıysa interconnect'te saat geçişini etkinleştirin.
+   Ekran okuyucu ve bit akışı DMA'sı aynı interconnect'e ikinci/üçüncü master olarak bağlanabilir.
+   `G_FB_BASE`, DDR penceresinde 72 MiB'lık boş, 4 MiB hizalı bir alanı göstermelidir.
+4. Bit akışı kaynağı: `s_axis_*` (8 bit) arayüzüne herhangi bir fabric kaynağı bağlanabilir (DDR'dan
+   okuyan basit bir DMA, Ethernet/UDP alıcısı, SD kart okuyucu...). Akışın son baytında `tlast=1`.
+5. Ekran: `o_frame_valid/index` ile gelen tamponu, kitin HDMI yolunu besleyen bir çerçeve okuyucu
+   (YUV420 → YUV422/RGB dönüşümü ile) okur; okuma bitince `i_release` ile geri verir. Çıkış çerçeve
+   hızını ayarlamak (ör. 30 fps) tüketicinin görevidir; tüketici tamponu tutarken çözücü o tamponu
+   kullanmaz, en fazla 18 tampon döngüdedir.
+6. `o_error`, `o_stream_done` ve `o_pic_count` bir LED'e / SmartDebug'a / Identify'a bağlanabilir.
+
+### 7.3 Açık kaynak tahmini (Libero olmadan)
+
+`scripts/synth_estimate.sh`, her modülü GHDL ile Verilog'a çevirip yosys `synth_microchip` ile
+PolarFire hücrelerine eşler ve `scripts/pf_depth.py` ile en uzun kayıttan kayda yolu LUT seviyesi
+olarak verir (taşıma zinciri bit başına 0.1 seviye sayılır). Sonuçlar bölüm 6.1'dedir; kesin
+değerler Libero'dan alınmalıdır.
 
 ## 8. Dizin yapısı
 
@@ -199,7 +271,9 @@ alınmalıdır.
 model/    C referans modeli (h264_model.c)
 rtl/      VHDL-2008 RTL
 tb/       GHDL testbench'leri (tb_parse, tb_top, tb_util_pkg)
-scripts/  gen_streams.sh, gen_tables.py, run_sim.sh, yuvcmp.py
+scripts/  gen_streams.sh, stream_tools.py, gen_tables.py, run_sim.sh, yuvcmp.py,
+          synth_estimate.sh, pf_depth.py
+libero/   create_project.tcl (Libero SoC projesi + sentez), h264_dec.sdc
 ```
 
 ## 9. Bilinen sınırlar / yol haritası
@@ -207,5 +281,6 @@ scripts/  gen_streams.sh, gen_tables.py, run_sim.sh, yuvcmp.py
 * Main/High profil (CABAC, B slice, 8x8 dönüşüm) desteklenmiyor.
 * Çıkış sırası çözme sırasıdır; B slice olmayan akışlarda bu, gösterim sırasıyla aynıdır.
 * Hata gizleme (error concealment) yok; eksik slice'lı bir resim tamamlanmaz.
-* Performans iyileştirmeleri: recon'da blok boru hattı, MC'de MB'ler arası örtüşme, CAVLC'de
-  sembol başına tek çevrim.
+* Zamanlama yalnızca açık kaynak araçlarla tahmin edildi (bölüm 6.1); Libero'da doğrulanmalıdır.
+* Olası iyileştirmeler: deblock'ta MB yüklemesini önceki MB'nin çıkışıyla örtüştürmek, CAVLC'de
+  level + run_before'u tek adımda çözmek, tahmin tamponunu LSRAM'e taşımak.
