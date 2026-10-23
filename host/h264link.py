@@ -11,9 +11,9 @@ The sender keeps up to WINDOW frames in flight, never more payload than the
 FIFO space (credit) the last response reported, retransmits everything from
 the expected frame on a NAK (go-back-N) and after a timeout.
 
-Transports: a serial port (UART link, rtl/h264_dec_uart_top.vhd) or
-"udp://IP[:PORT]" (Ethernet through the MSS firmware in kit/, one frame per
-datagram, rtl/h264_dec_mss_top.vhd).
+Transports: UDP (Ethernet through the MSS firmware in kit/, one frame per
+datagram, rtl/h264_dec_mss_top.vhd) or a serial port (optional UART link,
+rtl/h264_dec_uart_top.vhd; also used by the tests).
 """
 import binascii
 import collections
@@ -129,7 +129,8 @@ class Sender:
         self.port = port
         self.baud = baud
         # base retransmission timeout: a LAN answers in well under a millisecond
-        self.rto = 0.03 if isinstance(port, UdpPort) else 0.25
+        self.udp = isinstance(port, UdpPort)
+        self.rto = 0.03 if self.udp else 0.25
         self.parser = ResponseParser()
         self.last = None              # last response
         self.log = log or (lambda msg: None)
@@ -170,6 +171,9 @@ class Sender:
                 for r in self._poll(0.02):
                     if want(r):
                         return r
+        if self.udp:
+            raise LinkError("no answer from the kit at %s:%d (type %02x) - IP address, cable, firmware?"
+                            % (self.port.addr + (ftype,)))
         raise LinkError("no answer from the FPGA (type %02x) - port, baud rate, cabling?" % ftype)
 
     # -- commands ------------------------------------------------------
@@ -181,8 +185,8 @@ class Sender:
         self.seq = 1
         return r
 
-    def status(self):
-        return self._command(T_STATUS, 0, lambda r: r.rtype == R_STATUS)
+    def status(self, tries=6, timeout=0.3):
+        return self._command(T_STATUS, 0, lambda r: r.rtype == R_STATUS, tries, timeout)
 
     def send(self, chunks, progress=None):
         """send the byte chunks (iterable of bytes); returns bytes sent"""
@@ -308,15 +312,13 @@ class UdpPort:
         while r:
             try:
                 self.buf += self.sock.recv(65536)
-            except (BlockingIOError, InterruptedError):
-                break
-            except ConnectionRefusedError:     # ICMP port unreachable: nobody listens yet
+            except OSError:                    # nothing more, or an ICMP error (unreachable)
                 break
 
     def write(self, data):
         try:
             self.sock.send(data)
-        except (ConnectionRefusedError, BlockingIOError):
+        except OSError:
             pass                               # lost; the link protocol resends
         return len(data)
 
@@ -339,6 +341,38 @@ class UdpPort:
 
     def close(self):
         self.sock.close()
+
+
+def local_address(host, port=UDP_PORT):
+    """local IPv4 address the PC uses to reach host (nothing is sent), None without a route"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((host, port))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def system_ping(host, timeout=1.0):
+    """one ICMP echo with the system ping command: True / False, None if there is none"""
+    exe = shutil.which("ping")
+    if not exe:
+        return None
+    if sys.platform.startswith("win"):
+        cmd = [exe, "-n", "1", "-w", str(int(timeout * 1000)), host]
+    elif sys.platform == "darwin":
+        cmd = [exe, "-c", "1", "-W", str(int(timeout * 1000)), host]
+    else:
+        cmd = [exe, "-c", "1", "-W", str(max(1, round(timeout))), host]
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout + 5,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    # Windows ping exits with 0 on "destination host unreachable" too; only real replies carry TTL
+    return r.returncode == 0 and b"ttl=" in r.stdout.lower()
 
 
 def open_port(name, baud=2000000):

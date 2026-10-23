@@ -9,8 +9,8 @@ tamamen FPGA dokusunda (fabric) çalışmak üzere yazılmış bir **H.264 / AVC
   (planar YUV 4:2:0) ve çözme sırasıyla bir çerçeve tanıtım arayüzünden bildirilir.
 * Bit-exact: Üretilen tüm test akışlarında çıktı, **ffmpeg** çıktısıyla bayt bayt aynıdır
   (aşağıdaki doğrulama tablosuna bakın).
-* PC'den video gönderme: seri hat (bölüm 8, yalnızca fabric) veya Ethernet (bölüm 9; MSS'teki
-  küçük bir bare-metal program yalnızca ağ paketlerini fabric'e taşır, çözme yine fabric'tedir).
+* PC'den video gönderme: **Ethernet** (bölüm 9; MSS'teki küçük bir bare-metal program yalnızca ağ
+  paketlerini fabric'e taşır, çözme yine fabric'tedir). İsteğe bağlı seri hat alternatifi bölüm 8'dedir.
 
 ## 1. Desteklenen özellikler
 
@@ -290,11 +290,14 @@ PolarFire hücrelerine eşler ve `scripts/pf_depth.py` ile en uzun kayıttan kay
 olarak verir (taşıma zinciri bit başına 0.1 seviye sayılır). Sonuçlar bölüm 6.1'dedir; kesin
 değerler Libero'dan alınmalıdır.
 
-## 8. PC'den kite video gönderme (seri bağlantı)
+## 8. Bağlantı protokolü ve isteğe bağlı seri bağlantı
+
+> Kiti PC'ye Ethernet ile bağlıyorsanız seri hat gerekmez, doğrudan bölüm 9'a geçin. Aşağıdaki
+> protokol (8.2) Ethernet yolunda da aynen kullanılır.
 
 ```
  PC                                   MPFS250 Video Kit (yalnızca fabric)
- h264_gui.py / h264_send.py           ┌────────────────────────────────────────────────────┐
+ h264_send.py --serial PORT           ┌────────────────────────────────────────────────────┐
  ffmpeg ile Baseline'a dönüştürme ──► │ uart_rx ─► h264_uart_rx ─► h264_link ─► h264_dec_top│─► DDR4 / ekran
  (gerekirse), çerçeveleme, CRC  USB   │ uart_tx ◄─ h264_uart_tx ◄─ (32 KB FIFO)  AXI-Stream │
                          USB-UART ◄── └────────────────────────────────────────────────────┘
@@ -342,15 +345,15 @@ yüzden dönüştürme yaparken programlar varsayılan bit hızını bağlantıy
 
 ### 8.3 PC programları (`host/`)
 
-Gerekenler: Python 3.8+, `pip install pyserial`, dönüştürme için PATH'te libx264'lü ffmpeg. GUI
-Tkinter kullanır (Windows/macOS'ta Python ile gelir; Linux'ta `python3-tk`).
+Gerekenler: Python 3.8+, dönüştürme için PATH'te libx264'lü ffmpeg; seri hat için ayrıca
+`pip install pyserial`. GUI (`h264_gui.py`) yalnızca Ethernet içindir (bölüm 9.4); seri hatta komut
+satırı programı `--serial` ile kullanılır:
 
 ```sh
-python host/h264_gui.py                                   # arayüz: port, video, boyut, bit hızı, ilerleme, durum
-python host/h264_send.py --list                           # seri portlar
-python host/h264_send.py -p COM5 video.264                # Baseline .264 dosyasını olduğu gibi gönder
-python host/h264_send.py -p COM5 film.mp4 --size 1280x720 --bitrate 1.2M   # ffmpeg ile dönüştürerek
-python host/h264_send.py -p COM5 --status                 # çözücü durumu
+python host/h264_send.py --list                                    # seri portlar
+python host/h264_send.py --serial COM5 video.264                   # Baseline .264 dosyasını olduğu gibi gönder
+python host/h264_send.py --serial COM5 film.mp4 --size 1280x720 --bitrate 1.2M   # ffmpeg ile dönüştürerek
+python host/h264_send.py --serial COM5 --status                    # çözücü durumu
 ```
 
 Baseline olmayan dosyalar (`.mp4`, `.mkv`, High profil `.264`...) gönderilirken ffmpeg ile
@@ -361,7 +364,7 @@ diyene kadar resim sayısını gösterir.
 Kit olmadan denemek için `host/fpga_emu.py` FPGA tarafının yazılım modelidir (RTL ile aynı
 protokol davranışı, sınırlı FIFO, yavaş çözücü ve hata enjeksiyonu); Linux/macOS'ta sözde
 terminal üzerinde çalışır: `python3 host/fpga_emu.py --pty` → yazdığı `/dev/pts/N` ile
-`h264_send.py -p /dev/pts/N ...`.
+`h264_send.py --serial /dev/pts/N ...`.
 
 ### 8.4 Doğrulama
 
@@ -370,7 +373,6 @@ terminal üzerinde çalışır: `python3 host/fpga_emu.py --pty` → yazdığı 
 | `scripts/run_sim.sh link streams <ad>` (`tb/tb_link.vhd`) | Python'un ürettiği çerçeveler UART üzerinden RTL'e; CRC hatalı çerçeve (NAK + yeniden gönderme), sıra dışı çerçeve, tekrar gönderilen çerçeve, küçük FIFO ile kredi bekleme, rastgele geri basınç, START; RTL yanıtları Python ayrıştırıcıyla denetlenir | qcif_ip, qcif_intra ve 300 KB rastgele veri (571 çerçeve, sıra numarası taşması): çıktı birebir, `tlast` son baytta |
 | `scripts/run_sim.sh top-uart streams <ad>` | Akış UART + protokol üzerinden tam çözücüye (bir çerçeve bilerek bozuk) | qcif_ip, qcif_intra, real_coffee_cif (fotoğraf klibi, 30 kare): YUV ffmpeg ile bit-exact |
 | `python3 host/test_link.py <akış.264>` | Gerçek pyserial ile PC programı ↔ FPGA modeli (sözde terminal): temiz hat, bayt hataları + kayıp yanıtlar, küçük FIFO + yavaş çözücü | qcif_ip, real_coffee_cif: tümü birebir |
-| GUI (Xvfb altında, FPGA modeline karşı) | .264 dosyası ve ffmpeg ile dönüştürülen High profil MP4 | Teslim edilen akış birebir / Constrained Baseline, C modeli ve ffmpeg ile aynı çözülüyor |
 
 Kaynak (yosys tahmini): `h264_link` ~500 LUT, 355 FF, 16 LSRAM (32 KB FIFO); UART'lar ~70 LUT.
 
@@ -379,7 +381,7 @@ Kaynak (yosys tahmini): `h264_link` ~500 LUT, 355 FF, 16 LSRAM (32 KB FIFO); UAR
 ```
  PC                                MPFS250 Video Kit
  h264_send.py / h264_gui.py        ┌─ MSS (tek çekirdek, Linux yok) ─┐     ┌─ fabric ─────────────────────────────────┐
- -p udp://192.168.10.2   UDP 5000  │ GEM0 ─► kit/ yazılımı           │ APB │ h264_apb_bridge ─► h264_link ─► h264_dec_top │─► DDR4
+ --ip 192.168.10.2       UDP 5000  │ GEM0 ─► kit/ yazılımı           │ APB │ h264_apb_bridge ─► h264_link ─► h264_dec_top │─► DDR4
  (bir datagram = bir çerçeve) ───► │ (ARP, ping, UDP; bayt taşır)    │────►│  (FIC3)            (32 KB FIFO) AXI-Stream │
                  RJ45 / VSC8662 ◄──│ SGMII                           │◄────│                                           │
                                    └─────────────────────────────────┘     └───────────────────────────────────────────┘
@@ -476,25 +478,46 @@ yazar ve saniyede bir yeniden dener (FIC3 adresi / saati / reset'i yanlışsa il
 PC'nin Ethernet arayüzüne aynı alt ağdan sabit bir adres verin (ör. `192.168.10.1/24`), kiti doğrudan
 ya da bir anahtar üzerinden bağlayın; `ping 192.168.10.2` yanıt vermelidir.
 
+Kit DHCP kullanmaz; adresi yazılımda sabittir (`kit/src/app_config.h`: `APP_IP`, varsayılan
+`192.168.10.2`) ve açılışta kit konsoluna yazılır. Kiti mevcut bir ağa bağlayacaksanız o ağda boş bir
+adresle derleyin (ör. `-DAPP_IP='IP4(192,168,1,50)'`).
+
+**Arayüz (`python host/h264_gui.py`):** Python 3.8+ ve Tkinter yeterlidir (pyserial gerekmez);
+dönüştürme için PATH'te libx264'lü ffmpeg. "Kit IP" ve "UDP port" alanlarını doldurun, önce
+**Bağlantıyı test et**, sonra videoyu seçip **Gönder**. Test, yolu adım adım dener ve sorunun nerede
+olduğunu söyler:
+
+| Adım | Ne denetlenir | Başarısızsa |
+|---|---|---|
+| PC adresi | PC'nin kite hangi adresle gideceği (kitle aynı /24 ağda mı?) | PC'nin Ethernet kartına kitin ağından sabit adres verin |
+| Ping | Kit ağda ve MSS yazılımı çalışıyor mu (yalnızca MSS yanıtlar) | kablo / bağlantı ışıkları, kit yazılımı (konsolda "link up"), `APP_IP` |
+| Durum sorgusu | MSS üzerinden fabric'teki `h264_link` yanıt veriyor mu; 10 sorguda gidiş-dönüş süresi | ping geçip bu adım kalıyorsa: FPGA'da `h264_dec_mss_top`, FIC3 adresi (`FABRIC_BASE`) ve saati; kit konsolunda "no h264_apb_bridge" |
+
+Test çözücüyü sıfırlamaz (yalnızca STATUS sorar); çözücü durumu (resim sayısı, çözünürlük, FIFO)
+pencerenin alt satırında görünür.
+
+**Komut satırı:**
+
 ```sh
-python host/h264_send.py -p udp://192.168.10.2 film.mp4 --size 1920x1080 --bitrate 8M
-python host/h264_send.py -p udp://192.168.10.2 video.264          # Baseline dosya olduğu gibi
+python host/h264_send.py film.mp4 --size 1920x1080 --bitrate 8M    # kit 192.168.10.2 (varsayılan)
+python host/h264_send.py --ip 192.168.1.50 video.264                # Baseline dosya olduğu gibi
+python host/h264_send.py --status                                   # çözücü durumu
 ffmpeg -re -i giris.mp4 -an -vf format=yuv420p -c:v libx264 -profile:v baseline -tune zerolatency \
        -x264-params bframes=0:cabac=0:8x8dct=0:weightp=0 -b:v 6M -f h264 - \
-  | python host/h264_send.py -p udp://192.168.10.2 -               # canlı akış (stdin)
-python host/h264_gui.py                                             # Port kutusuna udp://192.168.10.2:5000
+  | python host/h264_send.py -                                      # canlı akış (stdin)
 ```
 
-UDP için pyserial gerekmez. Ethernet'te dönüştürme için varsayılan bit hızı 8 Mbit/s'dir; yeniden
-gönderme zaman aşımı seri hattaki 0.25 s yerine 30 ms'dir. Windows'ta güvenlik duvarı Python'a gelen
-UDP yanıtlarını engellerse izin verin.
+Kitin adresi `--ip` ile ya da `H264_KIT_IP` ortam değişkeniyle verilir; UDP portu `--port` (5000).
+Ethernet'te dönüştürme için varsayılan bit hızı 8 Mbit/s'dir; yeniden gönderme zaman aşımı 30 ms'dir.
+Windows'ta güvenlik duvarı Python'a gelen UDP yanıtlarını engellerse izin verin.
 
 ### 9.5 Doğrulama
 
 | Test | Kapsam | Sonuç |
 |---|---|---|
 | `scripts/run_sim.sh apb streams <ad>` (`tb/tb_apb.vhd`) | Yazılımın yerine geçen APB master, Python'un ürettiği çerçeveleri TXDATA4/TXDATA ile yazar, yanıtları RXDATA'dan okur: TXFREE ile kredi bekleme, bozuk çerçeve (NAK + yeniden gönderme), tekrar çerçeve, END, CTRL sıfırlama; yanıtlar Python ayrıştırıcıyla denetlenir | qcif_ip, real_coffee_cif, hd720: çıktı birebir, `tlast` son baytta |
-| `kit/sim/test_udp.sh <akış.264>` (Linux derlemesi, TAP + FPGA modeli; root) | Gerçek ağ yığını üzerinden ping ve `h264_send.py -p udp://...`; `KIT_LOSS` ile iki yönde paket kaybı | 4.6 MB 1080p akış: kayıpsız 83 Mbit/s, %1 kayıp 26.7 Mbit/s, %5 kayıp 5.9 Mbit/s — hepsi birebir; ffmpeg'den canlı boru (1080p, 6 Mbit/s) birebir; GUI ile MP4 dönüştürerek gönderme |
+| `kit/sim/test_udp.sh <akış.264>` (Linux derlemesi, TAP + FPGA modeli; root) | Gerçek ağ yığını üzerinden ping ve `h264_send.py --ip ...`; `KIT_LOSS` ile iki yönde paket kaybı | 4.6 MB 1080p akış: kayıpsız 83 Mbit/s, %1 kayıp 26.7 Mbit/s, %5 kayıp 5.9 Mbit/s — hepsi birebir; ffmpeg'den canlı boru (1080p, 6 Mbit/s) birebir; GUI ile MP4 dönüştürerek gönderme |
+| GUI, Xvfb altında `kit/sim`'e karşı | "Bağlantıyı test et": (1) her şey çalışıyor, (2) MSS yazılımı çalışıyor ama fabric sessiz, (3a) kit yok ve PC başka ağda, (3b) aynı ağda yanlış IP; ardından gönderme (.264 dosyası; High profil MP4 dönüştürülerek, %1 paket kaybıyla) | Dört durumda da doğru adım başarısız ve doğru öneri gösterildi; gönderilen akışlar birebir, MP4'ten üretilen akış Constrained Baseline ve C modeliyle ffmpeg aynı çözüyor |
 | RISC-V derleme denetimi | `kit/` yazılımının tamamı clang ile `rv64imac`/`lp64` hedefine, Microchip `platform` deposunun HAL ve MSS MAC/UART sürücü başlıklarına ve Video Kit referans MSS XML'inden üretilmiş `fpga_design_config`'e karşı derlendi (`-Wall -Wextra`, uyarısız); kullanılan tüm sürücü sembollerinin tanımlı olduğu kontrol edildi | Bağlanıp (link) donanımda çalıştırılmadı |
 
 Kitte çalıştırmak için: 9.1–9.3'teki adres/saat/PHY ayarları doğrulanmalıdır. Simülasyonda hız

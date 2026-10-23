@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""Send an H.264 video from the PC to the PolarFire decoder (serial or Ethernet).
+"""Send an H.264 video from the PC to the PolarFire decoder over Ethernet.
 
-    h264_send.py --list
-    h264_send.py -p COM5 video.264                 send an Annex-B Baseline stream
-    h264_send.py -p /dev/ttyUSB2 film.mp4 --size 1280x720 --bitrate 1.2M
+    h264_send.py video.264                         send an Annex-B Baseline stream to the kit
+                                                   (kit/ firmware, default 192.168.10.2)
+    h264_send.py --ip 192.168.1.50 film.mp4 --size 1920x1080 --bitrate 8M
                                                    convert with ffmpeg on the fly
-    h264_send.py -p udp://192.168.10.2 film.mp4 --size 1920x1080 --bitrate 8M
-                                                   over Ethernet (kit/ firmware)
-    ffmpeg -i cam.mp4 ... -f h264 - | h264_send.py -p udp://192.168.10.2 -
+    ffmpeg -i cam.mp4 ... -f h264 - | h264_send.py -
                                                    stream from a pipe
-    h264_send.py -p COM5 --status                  decoder status only
+    h264_send.py --status                          decoder status only
 
 Files that are not a Constrained Baseline Annex-B stream (.mp4, .mkv,
 High profile .264, ...) are converted with ffmpeg (must be in PATH) while
-they are sent.  The serial link carries about baud * 0.8 bit/s (2 Mbaud:
-1.6 Mbit/s); a stream with a higher bit rate still decodes correctly, only
-slower than real time.  Serial ports need pyserial (pip install pyserial).
+they are sent.  The optional UART link (rtl/h264_dec_uart_top.vhd) is used
+with --serial PORT [--baud N] instead (needs pyserial).
 """
 import argparse
 import os
@@ -44,9 +41,9 @@ def human(n):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", nargs="?", help="video file (.264 / .h264 or anything ffmpeg reads), - = stdin")
-    ap.add_argument("-p", "--port", help="serial port (COM5, /dev/ttyUSB0, ...) or udp://IP[:PORT]")
-    ap.add_argument("-b", "--baud", type=int, default=2000000, help="baud rate (default 2000000, must match G_BAUD)")
-    ap.add_argument("--list", action="store_true", help="list serial ports")
+    ap.add_argument("--ip", default=os.environ.get("H264_KIT_IP", "192.168.10.2"),
+                    help="IP address of the kit (default 192.168.10.2 or $H264_KIT_IP)")
+    ap.add_argument("--port", type=int, default=hl.UDP_PORT, help="UDP port (default %d)" % hl.UDP_PORT)
     ap.add_argument("--status", action="store_true", help="only print the decoder status")
     ap.add_argument("--convert", action="store_true", help="always convert with ffmpeg")
     ap.add_argument("--raw", action="store_true", help="never convert, send the file as it is")
@@ -54,14 +51,23 @@ def main():
     ap.add_argument("--bitrate", help="bit rate when converting, e.g. 1.2M (default: fits the link)")
     ap.add_argument("--fps", type=float, help="frame rate when converting")
     ap.add_argument("--no-wait", action="store_true", help="do not wait for the decoder after END")
+    uart = ap.add_argument_group("optional UART link instead of Ethernet")
+    uart.add_argument("--serial", metavar="PORT", help="serial port (COM5, /dev/ttyUSB0, ...)")
+    uart.add_argument("-b", "--baud", type=int, default=2000000, help="baud rate (default 2000000, = G_BAUD)")
+    uart.add_argument("--list", action="store_true", help="list serial ports")
     a = ap.parse_args()
 
     if a.list:
         list_ports()
         return 0
-    if not a.port:
-        ap.error("--port is required (see --list)")
-    port, baud = hl.open_port(a.port, a.baud)
+    try:
+        if a.serial:
+            port, baud = hl.open_port(a.serial, a.baud)
+        else:
+            port, baud = hl.UdpPort(a.ip, a.port), hl.UDP_BAUD
+    except OSError as e:
+        print("error: cannot open %s: %s" % (a.serial or "%s:%d" % (a.ip, a.port), e))
+        return 1
     snd = hl.Sender(port, baud, log=lambda m: print("\n" + m))
     try:
         if a.status:

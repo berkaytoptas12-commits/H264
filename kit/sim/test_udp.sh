@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end test of the Ethernet path without the kit (Linux, root for TAP):
 # kit_sim (bridge firmware on a TAP device + host/fpga_emu.py as the fabric)
-# <- ping, h264_send.py -p udp://192.168.77.2 with packet loss in both directions.
+# <- ping, h264_send.py --ip 192.168.77.2 with packet loss in both directions.
 #
 #   test_udp.sh <stream.264> [loss ...]      default losses: 0 0.01 0.05
 set -uo pipefail
@@ -55,7 +55,7 @@ for loss in "${LOSSES[@]}"; do
     sleep 0.7
     res="OK"
     if [ "$loss" = 0 ]; then ping_kit 192.168.77.2 > "$TMP/ping.txt" || res="PING FAILED"; fi
-    python3 "$ROOT/host/h264_send.py" -p udp://192.168.77.2 "$SRC" > "$TMP/send.txt" 2>&1 || res="SEND FAILED"
+    python3 "$ROOT/host/h264_send.py" --ip 192.168.77.2 "$SRC" > "$TMP/send.txt" 2>&1 || res="SEND FAILED"
     kill -TERM $kit; wait $kit 2>/dev/null
     cmp -s "$TMP/rx.264" "$SRC" || res="${res/OK/}DATA MISMATCH"
     [ "$res" = OK ] || fail=$((fail + 1))
