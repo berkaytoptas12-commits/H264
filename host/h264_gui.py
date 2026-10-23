@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Graphical sender for the PolarFire H.264 decoder (Tkinter + pyserial).
+"""Graphical sender for the PolarFire H.264 decoder (Tkinter; pyserial for
+serial ports).
 
     python h264_gui.py
 
-Pick the serial port and the video, press "Gönder".  Files that are not a
+Pick the serial port (or type udp://IP[:PORT] for the Ethernet firmware in
+kit/) and the video, press "Gönder".  Files that are not a
 Constrained Baseline Annex-B stream are converted with ffmpeg on the fly
 (size / bit rate from the fields).  The window shows the progress and the
 decoder status (pictures, resolution, errors) reported by the FPGA.
@@ -17,6 +19,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import h264link as hl
 
+UDP_DEFAULT = "udp://192.168.10.2:5000"
 SIZES = ["orijinal", "1920x1080", "1280x720", "854x480", "640x480", "352x288"]
 
 
@@ -37,12 +40,12 @@ class App:
         root.rowconfigure(0, weight=1)
         f.columnconfigure(1, weight=1)
 
-        ttk.Label(f, text="Seri port").grid(row=0, column=0, sticky="w")
+        ttk.Label(f, text="Port").grid(row=0, column=0, sticky="w")
         self.port = ttk.Combobox(f, width=30)
         self.port.grid(row=0, column=1, sticky="ew", padx=4)
         ttk.Button(f, text="Yenile", command=self.refresh_ports).grid(row=0, column=2, sticky="ew")
 
-        ttk.Label(f, text="Baud").grid(row=1, column=0, sticky="w")
+        ttk.Label(f, text="Baud (seri)").grid(row=1, column=0, sticky="w")
         self.baud = ttk.Combobox(f, width=12, values=["2000000", "3000000", "1000000", "921600", "12000000"])
         self.baud.set("2000000")
         self.baud.grid(row=1, column=1, sticky="w", padx=4)
@@ -97,6 +100,7 @@ class App:
             ports = [p.device for p in list_ports.comports()]
         except Exception:
             ports = []
+        ports.append(UDP_DEFAULT)
         self.port["values"] = ports
         if ports and not self.port.get():
             self.port.set(ports[0])
@@ -122,9 +126,8 @@ class App:
                     size=self.size.get(), bitrate=self.bitrate.get().strip())
 
     def open_sender(self, cfg):
-        import serial
-        port = serial.Serial(cfg["port"], cfg["baud"], timeout=0.01, write_timeout=5)
-        return hl.Sender(port, cfg["baud"], log=self.say)
+        port, baud = hl.open_port(cfg["port"], cfg["baud"])
+        return hl.Sender(port, baud, log=self.say)
 
     # -- actions -----------------------------------------------------------
     def status(self):
@@ -156,7 +159,7 @@ class App:
             messagebox.showerror("Hata", "Video dosyası seçin")
             return
         if not self.port.get():
-            messagebox.showerror("Hata", "Seri port seçin")
+            messagebox.showerror("Hata", "Seri port seçin ya da udp://IP yazın")
             return
         try:
             cfg = self.settings()
@@ -170,7 +173,7 @@ class App:
 
     def job(self, path, cfg):
         try:
-            baud = cfg["baud"]
+            baud = hl.UDP_BAUD if cfg["port"].lower().startswith("udp://") else cfg["baud"]
             convert = cfg["force"]
             prof = hl.sps_profile(path) if os.path.splitext(path)[1].lower() in (".264", ".h264") else None
             if prof is None or prof[0] != 66:
@@ -178,7 +181,7 @@ class App:
             if convert:
                 size = None if cfg["size"] == "orijinal" else tuple(int(v) for v in cfg["size"].split("x"))
                 br = cfg["bitrate"]
-                br = hl.parse_bitrate(br) if br and br != "otomatik" else hl.link_bitrate(baud) * 3 // 4
+                br = hl.parse_bitrate(br) if br and br != "otomatik" else hl.auto_bitrate(baud)
                 self.say("ffmpeg ile dönüştürülüyor: Constrained Baseline, %s, %.2f Mbit/s"
                          % (cfg["size"], br / 1e6))
                 chunks = hl.ffmpeg_chunks(path, size, br)

@@ -2,7 +2,8 @@
 # Libero SoC: stand-alone project for the H.264 decoder core
 #
 #   libero SCRIPT:create_project.tcl SCRIPT_ARGS:"<project_dir> [root]"
-#   root: h264_dec_top (default) or h264_dec_uart_top (decoder + PC link)
+#   root: h264_dec_top (default), h264_dec_uart_top (decoder + PC link over UART)
+#         or h264_dec_mss_top (decoder + PC link through the MSS, FIC3 APB)
 #
 # Creates a PolarFire SoC MPFS250TS project, imports the VHDL-2008 sources,
 # sets h264_dec_top as root, attaches h264_dec.sdc (100 MHz) and runs
@@ -33,14 +34,14 @@ new_project -location $proj_dir -name {h264_dec} -project_description {H.264 dec
 # VHDL-2008 is required (process(all), external names are only used in the testbench)
 project_settings -vhdl_mode {VHDL_2008}
 
-# root: h264_dec_top (AXI-Stream input) or h264_dec_uart_top (with the PC link)
+# root: h264_dec_top (AXI-Stream input), h264_dec_uart_top or h264_dec_mss_top
 set root "h264_dec_top"
 if {[llength $argv] > 1} { set root [lindex $argv 1] }
 
 set files {
     h264_pkg.vhd h264_tables_pkg.vhd h264_ram.vhd h264_nal.vhd h264_bitreader.vhd
     h264_hdr.vhd h264_mbparse.vhd h264_mc.vhd h264_recon.vhd h264_deblock.vhd h264_dec_top.vhd
-    h264_uart.vhd h264_link.vhd h264_dec_uart_top.vhd
+    h264_uart.vhd h264_link.vhd h264_dec_uart_top.vhd h264_apb_bridge.vhd h264_dec_mss_top.vhd
 }
 foreach f $files {
     import_files -convert_EDN_to_HDL 0 -library {work} -hdl_source [file join $src_dir $f]

@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Send an H.264 video from the PC to the PolarFire decoder over the serial link.
+"""Send an H.264 video from the PC to the PolarFire decoder (serial or Ethernet).
 
     h264_send.py --list
     h264_send.py -p COM5 video.264                 send an Annex-B Baseline stream
     h264_send.py -p /dev/ttyUSB2 film.mp4 --size 1280x720 --bitrate 1.2M
                                                    convert with ffmpeg on the fly
+    h264_send.py -p udp://192.168.10.2 film.mp4 --size 1920x1080 --bitrate 8M
+                                                   over Ethernet (kit/ firmware)
+    ffmpeg -i cam.mp4 ... -f h264 - | h264_send.py -p udp://192.168.10.2 -
+                                                   stream from a pipe
     h264_send.py -p COM5 --status                  decoder status only
 
 Files that are not a Constrained Baseline Annex-B stream (.mp4, .mkv,
 High profile .264, ...) are converted with ffmpeg (must be in PATH) while
-they are sent.  The link carries about baud * 0.8 bit/s (2 Mbaud: 1.6 Mbit/s);
-a stream with a higher bit rate still decodes correctly, only slower than
-real time.  Needs pyserial (pip install pyserial).
+they are sent.  The serial link carries about baud * 0.8 bit/s (2 Mbaud:
+1.6 Mbit/s); a stream with a higher bit rate still decodes correctly, only
+slower than real time.  Serial ports need pyserial (pip install pyserial).
 """
 import argparse
 import os
@@ -19,11 +23,6 @@ import sys
 import time
 
 import h264link as hl
-
-
-def open_port(name, baud):
-    import serial
-    return serial.Serial(name, baud, timeout=0.01, write_timeout=5)
 
 
 def list_ports():
@@ -44,8 +43,8 @@ def human(n):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("input", nargs="?", help="video file (.264 / .h264 or anything ffmpeg reads)")
-    ap.add_argument("-p", "--port", help="serial port (COM5, /dev/ttyUSB0, ...)")
+    ap.add_argument("input", nargs="?", help="video file (.264 / .h264 or anything ffmpeg reads), - = stdin")
+    ap.add_argument("-p", "--port", help="serial port (COM5, /dev/ttyUSB0, ...) or udp://IP[:PORT]")
     ap.add_argument("-b", "--baud", type=int, default=2000000, help="baud rate (default 2000000, must match G_BAUD)")
     ap.add_argument("--list", action="store_true", help="list serial ports")
     ap.add_argument("--status", action="store_true", help="only print the decoder status")
@@ -62,16 +61,16 @@ def main():
         return 0
     if not a.port:
         ap.error("--port is required (see --list)")
-    port = open_port(a.port, a.baud)
-    snd = hl.Sender(port, a.baud, log=lambda m: print("\n" + m))
+    port, baud = hl.open_port(a.port, a.baud)
+    snd = hl.Sender(port, baud, log=lambda m: print("\n" + m))
     try:
         if a.status:
             print(snd.status().describe())
             return 0
         if not a.input:
             ap.error("input file missing")
-        convert = a.convert
-        if not a.raw and not convert:
+        convert = a.convert and a.input != "-"
+        if not a.raw and not convert and a.input != "-":
             ext = os.path.splitext(a.input)[1].lower()
             prof = hl.sps_profile(a.input) if ext in (".264", ".h264", ".avc", ".bin") else None
             if prof is None:
@@ -82,13 +81,13 @@ def main():
                 print("profile_idc %d (not Baseline): converting with ffmpeg" % prof[0])
         if convert:
             size = tuple(int(v) for v in a.size.lower().split("x")) if a.size else None
-            br = hl.parse_bitrate(a.bitrate) or hl.link_bitrate(a.baud) * 3 // 4
+            br = hl.parse_bitrate(a.bitrate) or hl.auto_bitrate(baud)
             print("ffmpeg: Constrained Baseline, %s, %.2f Mbit/s" % (a.size or "original size", br / 1e6))
             chunks = hl.ffmpeg_chunks(a.input, size, br, a.fps)
             total = None
         else:
             chunks = hl.read_chunks(a.input)
-            total = os.path.getsize(a.input)
+            total = os.path.getsize(a.input) if a.input != "-" else None
 
         r = snd.start()
         print("link up: FIFO %s, decoder reset" % human(r.free + 1))

@@ -10,27 +10,35 @@ crc16 = CCITT (poly 0x1021, init 0xFFFF, no reflection) over type .. payload
 The sender keeps up to WINDOW frames in flight, never more payload than the
 FIFO space (credit) the last response reported, retransmits everything from
 the expected frame on a NAK (go-back-N) and after a timeout.
+
+Transports: a serial port (UART link, rtl/h264_dec_uart_top.vhd) or
+"udp://IP[:PORT]" (Ethernet through the MSS firmware in kit/, one frame per
+datagram, rtl/h264_dec_mss_top.vhd).
 """
+import binascii
 import collections
+import select
 import shutil
+import socket
 import struct
 import subprocess
+import sys
 import time
 
 T_DATA, T_END, T_START, T_STATUS = 0x01, 0x02, 0x03, 0x04
 R_ACK, R_NAK, R_STATUS = 0x81, 0x82, 0x83
 MAXLEN = 1024
 WINDOW = 16
+UDP_PORT = 5000
+UDP_BAUD = 100000000          # timing model of the Ethernet path (~80 Mbit/s payload)
+AUTO_BITRATE_MAX = 8000000    # default ffmpeg bit rate on fast links
 
 F_ERROR, F_DONE, F_END, F_EMPTY = 0x01, 0x02, 0x04, 0x08
 
 
 def crc16(data, crc=0xFFFF):
-    for b in data:
-        crc ^= b << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
-    return crc
+    """CRC-16/CCITT, poly 0x1021, no reflection (binascii runs it in C)"""
+    return binascii.crc_hqx(bytes(data), crc)
 
 
 def build_frame(ftype, seq, payload=b""):
@@ -120,6 +128,8 @@ class Sender:
     def __init__(self, port, baud=2000000, log=None):
         self.port = port
         self.baud = baud
+        # base retransmission timeout: a LAN answers in well under a millisecond
+        self.rto = 0.03 if isinstance(port, UdpPort) else 0.25
         self.parser = ResponseParser()
         self.last = None              # last response
         self.log = log or (lambda msg: None)
@@ -233,7 +243,7 @@ class Sender:
                         # go-back-N from the expected frame
                         for o in outstanding:
                             o[3] = False
-                        nak_hold = time.monotonic() + 0.05 + \
+                        nak_hold = time.monotonic() + self.rto / 5 + \
                             sum(o[2] for o in outstanding) * 1.2 * self._byte_time()
                 else:
                     while outstanding and not _before(r.seq, outstanding[0][0]):
@@ -244,7 +254,7 @@ class Sender:
             now = time.monotonic()
             in_flight = sum(o[2] for o in outstanding if o[3])
             # timeout: send everything not acknowledged again
-            if in_flight and now - last_rx > 0.25 + in_flight * 2 * self._byte_time():
+            if in_flight and now - last_rx > self.rto + in_flight * 2 * self._byte_time():
                 for o in outstanding:
                     o[3] = False
                 self.stats["timeout"] += 1
@@ -278,7 +288,77 @@ class Sender:
         return r
 
 
+class UdpPort:
+    """pyserial-like byte channel over UDP (write() = one datagram)"""
+
+    def __init__(self, host, port=UDP_PORT, timeout=0.01):
+        self.addr = (socket.gethostbyname(host), port)
+        self.timeout = timeout
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        self.sock.connect(self.addr)
+        self.sock.setblocking(False)
+        self.buf = bytearray()
+
+    def _fill(self, wait):
+        try:
+            r, _, _ = select.select([self.sock], [], [], wait)
+        except ValueError:
+            return
+        while r:
+            try:
+                self.buf += self.sock.recv(65536)
+            except (BlockingIOError, InterruptedError):
+                break
+            except ConnectionRefusedError:     # ICMP port unreachable: nobody listens yet
+                break
+
+    def write(self, data):
+        try:
+            self.sock.send(data)
+        except (ConnectionRefusedError, BlockingIOError):
+            pass                               # lost; the link protocol resends
+        return len(data)
+
+    @property
+    def in_waiting(self):
+        if not self.buf:
+            self._fill(0)
+        return len(self.buf)
+
+    def read(self, n=1):
+        if not self.buf:
+            self._fill(self.timeout)
+        d = bytes(self.buf[:n])
+        del self.buf[:n]
+        return d
+
+    def reset_input_buffer(self):
+        self._fill(0)
+        self.buf.clear()
+
+    def close(self):
+        self.sock.close()
+
+
+def open_port(name, baud=2000000):
+    """serial port name or udp://IP[:PORT]; returns (port, baud used for timing)"""
+    if name.lower().startswith("udp://"):
+        host, _, p = name[6:].strip("/").partition(":")
+        return UdpPort(host, int(p) if p else UDP_PORT), UDP_BAUD
+    import serial
+    return serial.Serial(name, baud, timeout=0.01, write_timeout=5), baud
+
+
 def read_chunks(path, size=64 * 1024):
+    """file contents in chunks; "-" reads stdin (e.g. a live ffmpeg pipe)"""
+    if path == "-":
+        f = sys.stdin.buffer
+        while True:
+            b = f.read1(size) if hasattr(f, "read1") else f.read(size)
+            if not b:
+                return
+            yield b
     with open(path, "rb") as f:
         while True:
             b = f.read(size)
@@ -356,3 +436,8 @@ def parse_bitrate(s):
 def link_bitrate(baud):
     """usable payload rate of the link in bit/s (8N1, ~1 % framing)"""
     return int(baud * 0.8 * 0.99)
+
+
+def auto_bitrate(baud):
+    """default bit rate when converting: 3/4 of the link, at most AUTO_BITRATE_MAX"""
+    return min(link_bitrate(baud) * 3 // 4, AUTO_BITRATE_MAX)

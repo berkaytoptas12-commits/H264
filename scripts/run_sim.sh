@@ -7,6 +7,8 @@
 #   run_sim.sh link  <stream_dir> [name ...]   PC link (tb_link): frames from host/h264link.py,
 #                                              errors, out of order, repeats, credit waits
 #   run_sim.sh top-uart <stream_dir> [name ...]  tb_top with the stream sent over the PC link
+#   run_sim.sh apb   <stream_dir> [name ...]   MSS path (tb_apb): link frames written through
+#                                              h264_apb_bridge as the firmware does
 #
 # Streams come from gen_streams.sh (<name>.264, <name>.ref.yuv, <name>.info).
 # Without names every stream in <stream_dir> is run.
@@ -32,14 +34,15 @@ GFLAGS="--std=08 -frelaxed --workdir=$WORK"
 MODEL="$WORK/h264_model"
 gcc -O2 -o "$MODEL" "$ROOT/model/h264_model.c" || exit 1
 
-RTL="h264_pkg h264_tables_pkg h264_ram h264_nal h264_bitreader h264_hdr h264_mbparse h264_mc h264_recon h264_deblock h264_dec_top h264_uart h264_link h264_dec_uart_top"
+RTL="h264_pkg h264_tables_pkg h264_ram h264_nal h264_bitreader h264_hdr h264_mbparse h264_mc h264_recon h264_deblock h264_dec_top h264_uart h264_link h264_dec_uart_top h264_apb_bridge h264_dec_mss_top"
 for f in $RTL; do $GHDL -a $GFLAGS "$ROOT/rtl/$f.vhd" || exit 1; done
-for f in tb_util_pkg tb_parse tb_top tb_link; do $GHDL -a $GFLAGS "$ROOT/tb/$f.vhd" || exit 1; done
+for f in tb_util_pkg tb_parse tb_top tb_link tb_apb; do $GHDL -a $GFLAGS "$ROOT/tb/$f.vhd" || exit 1; done
 
 case "$MODE" in
     parse) $GHDL -e $GFLAGS tb_parse || exit 1 ;;
     top|top-uart) $GHDL -e $GFLAGS tb_top || exit 1 ;;
     link) $GHDL -e $GFLAGS tb_link || exit 1 ;;
+    apb) $GHDL -e $GFLAGS tb_apb || exit 1 ;;
 esac
 VEC="python3 $ROOT/host/make_vectors.py"
 
@@ -60,12 +63,12 @@ for n in "${names[@]}"; do
         $GHDL -r $GFLAGS tb_parse --ieee-asserts=$IEEE_ASSERTS -gG_IN="$SDIR/$n.264" -gG_TRACE="$OUT/$n.rtl_trace.txt" \
             -gG_TIMEOUT_US="${TIMEOUT_US:-5000000}" > "$OUT/$n.log" 2>&1
         if cmp -s "$OUT/$n.model_trace.txt" "$OUT/$n.rtl_trace.txt"; then res="OK"; else res="TRACE MISMATCH"; fi
-    elif [ "$MODE" = link ]; then
+    elif [ "$MODE" = link ] || [ "$MODE" = apb ]; then
         $VEC "$SDIR/$n.264" "$OUT/$n.frames.txt" > /dev/null
-        $GHDL -r $GFLAGS tb_link --ieee-asserts=$IEEE_ASSERTS -gG_IN="$SDIR/$n.264" -gG_FRAMES="$OUT/$n.frames.txt" \
+        $GHDL -r $GFLAGS tb_$MODE --ieee-asserts=$IEEE_ASSERTS -gG_IN="$SDIR/$n.264" -gG_FRAMES="$OUT/$n.frames.txt" \
             -gG_RESP="$OUT/$n.resp.bin" > "$OUT/$n.log" 2>&1
-        if grep -q "link test passed" "$OUT/$n.log" && $VEC --check "$OUT/$n.resp.bin" > "$OUT/$n.resp.txt"; then
-            res="OK $(grep -o 'link test passed.*' "$OUT/$n.log")"
+        if grep -q "test passed" "$OUT/$n.log" && $VEC --check "$OUT/$n.resp.bin" > "$OUT/$n.resp.txt"; then
+            res="OK $(grep -o '[a-zA-Z ]*test passed.*' "$OUT/$n.log")"
         else
             res="FAIL (see $OUT/$n.log)"
         fi

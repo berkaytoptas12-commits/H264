@@ -9,6 +9,8 @@ tamamen FPGA dokusunda (fabric) çalışmak üzere yazılmış bir **H.264 / AVC
   (planar YUV 4:2:0) ve çözme sırasıyla bir çerçeve tanıtım arayüzünden bildirilir.
 * Bit-exact: Üretilen tüm test akışlarında çıktı, **ffmpeg** çıktısıyla bayt bayt aynıdır
   (aşağıdaki doğrulama tablosuna bakın).
+* PC'den video gönderme: seri hat (bölüm 8, yalnızca fabric) veya Ethernet (bölüm 9; MSS'teki
+  küçük bir bare-metal program yalnızca ağ paketlerini fabric'e taşır, çözme yine fabric'tedir).
 
 ## 1. Desteklenen özellikler
 
@@ -273,7 +275,8 @@ periyodu 13.333 ns'ye (75 MHz) çekin, 1080p30 yine karşılanır. Gerekli saat 
 4. Bit akışı kaynağı: `s_axis_*` (8 bit) arayüzüne herhangi bir fabric kaynağı bağlanabilir (DDR'dan
    okuyan basit bir DMA, Ethernet/UDP alıcısı, SD kart okuyucu...). Akışın son baytında `tlast=1`.
    Videoyu PC'den seri bağlantıyla göndermek için `h264_dec_top` yerine `h264_dec_uart_top` kullanın
-   (bölüm 8; Libero betiğinde `SCRIPT_ARGS:"./h264_dec_prj h264_dec_uart_top"`).
+   (bölüm 8; Libero betiğinde `SCRIPT_ARGS:"./h264_dec_prj h264_dec_uart_top"`), Ethernet üzerinden
+   göndermek için `h264_dec_mss_top` (bölüm 9).
 5. Ekran: `o_frame_valid/index` ile gelen tamponu, kitin HDMI yolunu besleyen bir çerçeve okuyucu
    (YUV420 → YUV422/RGB dönüşümü ile) okur; okuma bitince `i_release` ile geri verir. Çıkış çerçeve
    hızını ayarlamak (ör. 30 fps) tüketicinin görevidir; tüketici tamponu tutarken çözücü o tamponu
@@ -371,27 +374,158 @@ terminal üzerinde çalışır: `python3 host/fpga_emu.py --pty` → yazdığı 
 
 Kaynak (yosys tahmini): `h264_link` ~500 LUT, 355 FF, 16 LSRAM (32 KB FIFO); UART'lar ~70 LUT.
 
-## 9. Dizin yapısı
+## 9. PC'den kite video gönderme (Ethernet, MSS üzerinden)
+
+```
+ PC                                MPFS250 Video Kit
+ h264_send.py / h264_gui.py        ┌─ MSS (tek çekirdek, Linux yok) ─┐     ┌─ fabric ─────────────────────────────────┐
+ -p udp://192.168.10.2   UDP 5000  │ GEM0 ─► kit/ yazılımı           │ APB │ h264_apb_bridge ─► h264_link ─► h264_dec_top │─► DDR4
+ (bir datagram = bir çerçeve) ───► │ (ARP, ping, UDP; bayt taşır)    │────►│  (FIC3)            (32 KB FIFO) AXI-Stream │
+                 RJ45 / VSC8662 ◄──│ SGMII                           │◄────│                                           │
+                                   └─────────────────────────────────┘     └───────────────────────────────────────────┘
+```
+
+Kitteki Ethernet MAC'leri (GEM0/1) ve SGMII arayüzü MSS'in içindedir, fabric'ten doğrudan
+kullanılamaz; onları bir işlemcinin sürmesi gerekir. Bunun için Linux gerekmez: tek bir çekirdekte
+(varsayılan E51) çalışan küçük bir bare-metal program (`kit/`) yeterlidir. Program yalnızca bayt
+taşır: gelen UDP datagramlarının içeriğini olduğu gibi fabric'e yazar, `h264_link`'in yanıtlarını
+PC'ye geri yollar. Bölüm 8'deki protokol PC ile `h264_link` arasında **uçtan uca** aynen çalışır;
+CRC denetimi, yeniden gönderme ve kredi tabanlı akış kontrolü fabric'te kalır, kaybolan bir
+datagram yalnızca bir NAK / zaman aşımına mal olur. Çözme tamamen fabric'te yapılır.
+
+### 9.1 Fabric tarafı (`h264_dec_mss_top`)
+
+`h264_dec_mss_top` = `h264_apb_bridge` + `h264_link` + `h264_dec_top`. Libero betiğinde
+`SCRIPT_ARGS:"./h264_dec_prj h264_dec_mss_top"`; SmartDesign'da APB3 slave portunu MSS'in FIC3 APB
+initiator'una bağlayın (başka APB slave'ler de varsa CoreAPB3 üzerinden). Köprü adresin alt 12 bitini
+çözer (4 KB pencere). FIC3 penceresi `0x4000_0000 – 0x5FFF_FFFF`'tir; yazılımdaki `FABRIC_BASE`
+(varsayılan `0x40000000`) Libero bellek haritasındaki yuvanın adresine ayarlanmalıdır.
+
+**Saat:** APB, çözücüyle **aynı saatte** (`clk`) olmalıdır; MSS Configurator'da FIC3 saatini
+çözücünün PF_CCC çıkışından (100 MHz) besleyin. FIC3 başka bir saatte kalacaksa araya bir saat alanı
+geçişi gerekir (dahil değil).
+
+| Ofset | Yazmaç | Erişim | Anlamı |
+|---|---|---|---|
+| 0x00 | ID | R | `0x48323634` ("H264") |
+| 0x04 | CAPS | R | [15:0] TX FIFO girdi sayısı (512), [31:16] RX FIFO bayt sayısı (64) |
+| 0x08 | TXFREE | R | TX FIFO'daki boş girdi |
+| 0x0C | TXDATA | W | 1 bayt ([7:0]) |
+| 0x10 | TXDATA4 | W | 4 bayt ([7:0] ilk) |
+| 0x14 | RXCOUNT | R | RX FIFO'daki bayt sayısı |
+| 0x18 | RXDATA | R | [8] geçerli, [7:0] bayt; geçerliyse okuma baytı FIFO'dan alır |
+| 0x1C | STATUS | R | [0] çözücü hatası, [1] akış bitti |
+| 0x20 | PICTURES | R | çözülen resim sayısı |
+| 0x24 | SIZE | R | [11:0] genişlik, [27:16] yükseklik |
+| 0x28 | CTRL | W | [0]=1: bağlantıyı ve çözücüyü sıfırla, FIFO'ları boşalt |
+
+Kaynak (yosys tahmini): köprü ~193 LUT, 163 FF, 1 LSRAM + 1 uSRAM, en uzun yol 7 LUT seviyesi
+(+ `h264_link`, bölüm 8.4). LED'ler bölüm 8'deki gibidir.
+
+### 9.2 MSS Configurator
+
+* GEM0 (veya GEM1): SGMII, MDIO MSS I/O'larında. Video Kit'in referans MSS yapılandırmasında
+  (HSS deposundaki `MSS_video-kit_mss_cfg.xml`) iki SGMII kanalı, MAC0/MAC1 saatleri ve MDIO pinleri
+  (MSSIO 35/36) etkindir.
+* FIC3 etkin (APB), saati çözücü saati (9.1).
+* Konsol için MMUART0 (Video Kit referans tasarımında MMUART0/1 fabric üzerinden USB-UART'a gider;
+  kendi tasarımınızda da bağlı olmalı).
+
+### 9.3 Yazılım (`kit/`)
+
+| Dosya | İçerik |
+|---|---|
+| `kit/src/net.c` | Ethernet / ARP / IPv4 / ICMP echo (ping) / UDP; parçalama yok, yanıt isteğin geldiği MAC'e gider |
+| `kit/src/bridge.c` | UDP 5000 ↔ fabric: datagram baytları TXDATA4/TXDATA ile, yanıtlar 16 baytlık katlar hâlinde son göndericiye |
+| `kit/src/fabric_mmio.c` | `h264_apb_bridge` yazmaç erişimi (`FABRIC_BASE`) |
+| `kit/src/kit_main.c` | ana döngü, bağlantı durumu, 5 sn'de bir konsola istatistik |
+| `kit/src/app_config.h` | MAC (`02:00:00:48:32:64`), IP (`192.168.10.2/24`), UDP portu, `FABRIC_BASE` |
+| `kit/mss/port_mss.c` | Microchip MSS MAC sürücüsü (GEM, VSC8662), MMUART konsolu, SysTick |
+| `kit/mss/e51.c` | çekirdek giriş noktası (`KIT_HART=0` E51, `1` U54_1) |
+| `kit/sim/` | aynı kodun Linux derlemesi: TAP arayüzü + `host/fpga_emu.py` (kit olmadan test) |
+
+Derleme (SoftConsole): Microchip'in `polarfire-soc-bare-metal-examples` deposundaki
+`driver-examples/mss/mss-ethernet-mac/mpfs-mac-simple-test` projesini temel alın (HAL, MSS MAC ve
+VSC8662 PHY sürücüleri, bağlayıcı betikleri hazırdır):
+
+1. Projedeki `src/application` altındaki uygulama dosyalarını çıkarın, yerine `kit/mss/e51.c`,
+   `kit/mss/port_mss.c` ve `kit/src/*.c` ekleyin; `kit/src`'yi include yollarına ekleyin.
+2. `fpga_design_config` klasörünü kendi Libero tasarımınızın MSS XML'inden üretilmiş olanla
+   değiştirin (`platform/soc_config_generator/mpfs_configuration_generator.py`).
+3. Tanımlar: örnek projedeki `TARGET_G5_SOC`, `MSS_MAC_SIMPLE_TX_QUEUE`; gerekirse `APP_IP`,
+   `FABRIC_BASE` ve aşağıdaki kart ayarları (`-D...`).
+4. E51'de LIM/DDR'dan hata ayıklayıcıyla çalıştırın ya da eNVM'e yazın; HSS ile açılıyorsa
+   `KIT_HART=1` (U54_1). Konsol 115200 baud: IP, "link up" ve istatistikler.
+
+**Kart ayarları — Video Kit şemasından doğrulayın.** Varsayılanlar Microchip'in Icicle Kit
+örneğindeki VSC8662 bağlantısıdır; Video Kit için bunları donanımda doğrulayamadım:
+
+| Tanım | Varsayılan | Anlamı |
+|---|---|---|
+| `KIT_GEM` | 0 | veri için kullanılan MAC |
+| `KIT_MDIO_GEM` | 1 | PHY'nin MDIO hattının bağlı olduğu MAC (farklıysa o MAC yalnızca MDIO için başlatılır) |
+| `KIT_PHY_ADDR` | `PHY_VSC8662_0_MDIO_ADDR` (8) | PHY'nin MDIO adresi; `MSS_MAC_AUTO_DETECT_PHY_ADDRESS` ile tarama |
+| `kit_board_phy_reset()` | boş (weak) | PHY reset'i bir MSS GPIO'suna bağlıysa bu fonksiyonu yazıp bırakın |
+| `FABRIC_BASE` | `0x40000000` | köprünün FIC3 adresi |
+
+Yazılım başlarken köprünün ID yazmacını okur; bulamazsa konsola `no h264_apb_bridge at ...`
+yazar ve saniyede bir yeniden dener (FIC3 adresi / saati / reset'i yanlışsa ilk ipucu budur).
+
+### 9.4 PC tarafı
+
+PC'nin Ethernet arayüzüne aynı alt ağdan sabit bir adres verin (ör. `192.168.10.1/24`), kiti doğrudan
+ya da bir anahtar üzerinden bağlayın; `ping 192.168.10.2` yanıt vermelidir.
+
+```sh
+python host/h264_send.py -p udp://192.168.10.2 film.mp4 --size 1920x1080 --bitrate 8M
+python host/h264_send.py -p udp://192.168.10.2 video.264          # Baseline dosya olduğu gibi
+ffmpeg -re -i giris.mp4 -an -vf format=yuv420p -c:v libx264 -profile:v baseline -tune zerolatency \
+       -x264-params bframes=0:cabac=0:8x8dct=0:weightp=0 -b:v 6M -f h264 - \
+  | python host/h264_send.py -p udp://192.168.10.2 -               # canlı akış (stdin)
+python host/h264_gui.py                                             # Port kutusuna udp://192.168.10.2:5000
+```
+
+UDP için pyserial gerekmez. Ethernet'te dönüştürme için varsayılan bit hızı 8 Mbit/s'dir; yeniden
+gönderme zaman aşımı seri hattaki 0.25 s yerine 30 ms'dir. Windows'ta güvenlik duvarı Python'a gelen
+UDP yanıtlarını engellerse izin verin.
+
+### 9.5 Doğrulama
+
+| Test | Kapsam | Sonuç |
+|---|---|---|
+| `scripts/run_sim.sh apb streams <ad>` (`tb/tb_apb.vhd`) | Yazılımın yerine geçen APB master, Python'un ürettiği çerçeveleri TXDATA4/TXDATA ile yazar, yanıtları RXDATA'dan okur: TXFREE ile kredi bekleme, bozuk çerçeve (NAK + yeniden gönderme), tekrar çerçeve, END, CTRL sıfırlama; yanıtlar Python ayrıştırıcıyla denetlenir | qcif_ip, real_coffee_cif, hd720: çıktı birebir, `tlast` son baytta |
+| `kit/sim/test_udp.sh <akış.264>` (Linux derlemesi, TAP + FPGA modeli; root) | Gerçek ağ yığını üzerinden ping ve `h264_send.py -p udp://...`; `KIT_LOSS` ile iki yönde paket kaybı | 4.6 MB 1080p akış: kayıpsız 83 Mbit/s, %1 kayıp 26.7 Mbit/s, %5 kayıp 5.9 Mbit/s — hepsi birebir; ffmpeg'den canlı boru (1080p, 6 Mbit/s) birebir; GUI ile MP4 dönüştürerek gönderme |
+| RISC-V derleme denetimi | `kit/` yazılımının tamamı clang ile `rv64imac`/`lp64` hedefine, Microchip `platform` deposunun HAL ve MSS MAC/UART sürücü başlıklarına ve Video Kit referans MSS XML'inden üretilmiş `fpga_design_config`'e karşı derlendi (`-Wall -Wextra`, uyarısız); kullanılan tüm sürücü sembollerinin tanımlı olduğu kontrol edildi | Bağlanıp (link) donanımda çalıştırılmadı |
+
+Kitte çalıştırmak için: 9.1–9.3'teki adres/saat/PHY ayarları doğrulanmalıdır. Simülasyonda hız
+sınırı Python modelidir; kitte her 1 KB'lık çerçeve için bir kopya (alma kesmesi) ve 256 APB yazması
+yapılır, bu da çözücünün ihtiyacının (1080p 8 Mbit/s ≈ 1 MB/s) çok üstünde olmalıdır (tahmin).
+
+## 10. Dizin yapısı
 
 ```
 model/    C referans modeli (h264_model.c)
-rtl/      VHDL-2008 RTL
-tb/       GHDL testbench'leri (tb_parse, tb_top, tb_util_pkg)
+rtl/      VHDL-2008 RTL (çözücü; h264_uart / h264_link / h264_dec_uart_top: seri bağlantı;
+          h264_apb_bridge / h264_dec_mss_top: MSS üzerinden Ethernet)
+tb/       GHDL testbench'leri (tb_parse, tb_top, tb_link, tb_apb, tb_util_pkg)
 scripts/  gen_streams.sh, stream_tools.py, gen_tables.py, run_sim.sh, yuvcmp.py,
           synth_estimate.sh, pf_depth.py
-host/     PC programları: h264_send.py (komut satırı), h264_gui.py (arayüz), h264link.py (protokol),
-          fpga_emu.py (FPGA tarafının yazılım modeli), test_link.py, make_vectors.py
+host/     PC programları: h264_send.py (komut satırı), h264_gui.py (arayüz), h264link.py (protokol,
+          seri ve UDP), fpga_emu.py (FPGA tarafının yazılım modeli), test_link.py, make_vectors.py
+kit/      MSS bare-metal Ethernet köprüsü: src/ (taşınabilir), mss/ (Microchip HAL portu),
+          sim/ (Linux/TAP derlemesi)
 libero/   create_project.tcl (Libero SoC projesi + sentez), h264_dec.sdc, uart_pins.pdc (şablon)
 ```
 
-## 10. Bilinen sınırlar / yol haritası
+## 11. Bilinen sınırlar / yol haritası
 
 * Main/High profil (CABAC, B slice, 8x8 dönüşüm) desteklenmiyor.
 * Çıkış sırası çözme sırasıdır; B slice olmayan akışlarda bu, gösterim sırasıyla aynıdır.
 * Hata gizleme (error concealment) yok; eksik slice'lı bir resim tamamlanmaz.
 * Zamanlama yalnızca açık kaynak araçlarla tahmin edildi (bölüm 6.1); Libero'da doğrulanmalıdır.
-* PC bağlantısı UART hızıyla sınırlıdır (2–4 Mbaud). Kitteki iki Gigabit Ethernet (VSC8662, SGMII)
-  fabric'e bağlıysa `h264_link` bayt arayüzünün önüne bir UDP alıcısı konularak 100 Mbit/s üstüne
-  çıkılabilir; protokol motoru taşıyıcıdan bağımsızdır.
+* Seri PC bağlantısı UART hızıyla sınırlıdır (2–4 Mbaud). Ethernet yolu (bölüm 9) simülasyonda ve
+  RISC-V derleme denetiminde doğrulandı, kitte çalıştırılmadı; Video Kit'in PHY/MDIO bağlantısı,
+  PHY reset'i ve FIC3 adresi/saati kart üzerinde doğrulanmalıdır. FIC3 APB'si çözücüyle aynı saatte
+  olmalıdır (saat alanı geçişi yok).
 * Olası iyileştirmeler: deblock'ta MB yüklemesini önceki MB'nin çıkışıyla örtüştürmek, CAVLC'de
   level + run_before'u tek adımda çözmek, tahmin tamponunu LSRAM'e taşımak.

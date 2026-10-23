@@ -1,5 +1,5 @@
 # simulation outputs and generated streams
-sim/
+/sim/
 streams/
 *.yuv
 *.vcd

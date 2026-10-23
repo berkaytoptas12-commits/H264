@@ -6,6 +6,8 @@ Used to test the PC programs without the kit: it behaves like the RTL
 can inject errors on both directions.
 
     fpga_emu.py --pty                 serve on a pseudo terminal, prints its name
+    fpga_emu.py --stdio --out f.264   link bytes on stdin, responses on stdout
+                                      (used by the kit/sim firmware build)
     python3 -c "import fpga_emu"      (used by test_link.py)
 """
 import argparse
@@ -86,8 +88,18 @@ class FpgaModel:
         self.tx += r
 
     def rx(self, data):
-        for b in data:
-            if self.rnd.random() < self.p_rx_err:
+        i, n = 0, len(data)
+        while i < n:
+            if self.state == "PAY" and not self.p_rx_err:     # payload in one piece
+                k = min(self.ln - len(self.pay), n - i)
+                self.pay += data[i:i + k]
+                i += k
+                if len(self.pay) == self.ln:
+                    self.state = "C0"
+                continue
+            b = data[i]
+            i += 1
+            if self.p_rx_err and self.rnd.random() < self.p_rx_err:
                 b ^= 1 << self.rnd.randrange(8)
             self._byte(b)
 
@@ -160,32 +172,30 @@ class FpgaModel:
                 self.respond(R_STATUS, (self.exp - 1) & 0xFF)
 
 
-class PtyServer(threading.Thread):
-    """runs a FpgaModel on the master side of a pseudo terminal"""
+class FdServer(threading.Thread):
+    """runs a FpgaModel on a pair of file descriptors"""
 
-    def __init__(self, model, byte_rate=None):
+    def __init__(self, model, rfd, wfd, byte_rate=None):
         super().__init__(daemon=True)
-        import tty
         self.model = model
+        self.rfd, self.wfd = rfd, wfd
         self.byte_rate = byte_rate            # emulated serial speed (bytes/s) or None
-        self.master, slave = os.openpty()
-        tty.setraw(slave)
-        self.name = os.ttyname(slave)
-        self._slave = slave
         self.running = True
 
     def run(self):
         last = time.monotonic()
         budget = 0.0
         while self.running:
-            r, _, _ = select.select([self.master], [], [], 0.002)
+            r, _, _ = select.select([self.rfd], [], [], 0.002)
             now = time.monotonic()
             dt = now - last
             last = now
             if r:
                 try:
-                    data = os.read(self.master, 4096)
+                    data = os.read(self.rfd, 4096)
                 except OSError:
+                    break
+                if not data:
                     break
                 if self.byte_rate:
                     time.sleep(len(data) / self.byte_rate)
@@ -198,12 +208,29 @@ class PtyServer(threading.Thread):
                     budget = max(0.0, budget - n)
                 else:
                     n = len(self.model.tx)
-                os.write(self.master, bytes(self.model.tx[:n]))
+                try:
+                    os.write(self.wfd, bytes(self.model.tx[:n]))
+                except OSError:
+                    break
                 del self.model.tx[:n]
+        self.running = False
 
     def stop(self):
         self.running = False
         self.join(1)
+
+
+class PtyServer(FdServer):
+    """runs a FpgaModel on the master side of a pseudo terminal"""
+
+    def __init__(self, model, byte_rate=None):
+        import tty
+        master, slave = os.openpty()
+        tty.setraw(slave)
+        super().__init__(model, master, master, byte_rate)
+        self.master = master
+        self.name = os.ttyname(slave)
+        self._slave = slave
 
 
 def main():
@@ -212,20 +239,30 @@ def main():
     ap.add_argument("--depth", type=int, default=32768)
     ap.add_argument("--drain", type=float, default=None, help="decoder speed in bytes/s")
     ap.add_argument("--rx-err", type=float, default=0.0, help="probability of a corrupted byte")
+    ap.add_argument("--stdio", action="store_true", help="link bytes on stdin, responses on stdout")
+    ap.add_argument("--size", default="1280x720", help="resolution reported in the responses")
     ap.add_argument("--out", help="write the received stream to this file at the end")
     a = ap.parse_args()
-    m = FpgaModel(depth=a.depth, drain_rate=a.drain, p_rx_err=a.rx_err, width=1280, height=720)
-    srv = PtyServer(m)
+    w, h = (int(v) for v in a.size.split("x"))
+    m = FpgaModel(depth=a.depth, drain_rate=a.drain, p_rx_err=a.rx_err, width=w, height=h)
+    if a.stdio:
+        srv = FdServer(m, sys.stdin.fileno(), sys.stdout.fileno())
+        log = sys.stderr
+    else:
+        srv = PtyServer(m)
+        log = sys.stdout
+        print("FPGA model on", srv.name, "(Ctrl-C to stop)")
+        sys.stdout.flush()
     srv.start()
-    print("FPGA model on", srv.name, "(Ctrl-C to stop)")
-    sys.stdout.flush()
     try:
-        while True:
-            time.sleep(0.5)
+        while srv.is_alive():
+            srv.join(0.5)
     except KeyboardInterrupt:
         pass
     srv.stop()
-    print("frames ok %d, bad %d, bytes delivered %d, END %s" % (m.frames_ok, m.frames_bad, len(m.out), m.out_last))
+    m.drain(1e9)
+    print("frames ok %d, bad %d, bytes delivered %d, END %s" % (m.frames_ok, m.frames_bad, len(m.out), m.out_last),
+          file=log)
     if a.out:
         open(a.out, "wb").write(m.out)
 
