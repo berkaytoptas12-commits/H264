@@ -109,6 +109,7 @@ def main():
     ap.add_argument("--bitrev", action="store_true", help="HDMI lanes with reversed bit order "
                     "(try when the monitor shows nothing)")
     ap.add_argument("--no-wait", action="store_true", help="do not wait for the decoder after END")
+    ap.add_argument("--wait-timeout", type=float, default=30.0, help="seconds to wait for the decoder (30)")
     uart = ap.add_argument_group("optional UART link instead of Ethernet")
     uart.add_argument("--serial", metavar="PORT", help="serial port (COM5, /dev/ttyUSB0, ...)")
     uart.add_argument("-b", "--baud", type=int, default=2000000, help="baud rate (default 2000000, = G_BAUD)")
@@ -179,7 +180,7 @@ def main():
             human(n), dt, n * 8 / dt / 1e6 if dt else 0, snd.stats["frames"], snd.stats["retx"],
             snd.stats["nak"], snd.stats["timeout"]))
         if not a.no_wait:
-            r = snd.wait_done(timeout=30, progress=lambda r: sys.stdout.write("\rpictures %d   " % r.pictures))
+            r = snd.wait_done(timeout=a.wait_timeout, progress=lambda r: sys.stdout.write("\rpictures %d   " % r.pictures))
             print("\n" + r.describe())
             if r.error:
                 return 2

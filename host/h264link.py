@@ -16,8 +16,8 @@ datagram, rtl/h264_dec_mss_top.vhd) or a serial port (optional UART link,
 rtl/h264_dec_uart_top.vhd; also used by the tests).
 """
 import binascii
-import os
 import collections
+import os
 import select
 import shutil
 import socket
@@ -130,8 +130,11 @@ class Sender:
         self.port = port
         self.baud = baud
         # base retransmission timeout: a LAN answers in well under a millisecond
+        # (H264_RTO in seconds overrides it, e.g. against a slow RTL simulation)
         self.udp = isinstance(port, UdpPort)
-        self.rto = 0.03 if self.udp else 0.25
+        self.rto = float(os.environ.get("H264_RTO", 0)) or (0.03 if self.udp else 0.25)
+        self.cmd_timeout = max(0.3, self.rto)
+        self.status_every = max(0.02, min(1.0, self.rto / 10))   # credit polling interval
         self.parser = ResponseParser()
         self.last = None              # last response
         self.log = log or (lambda msg: None)
@@ -163,8 +166,9 @@ class Sender:
     def stop(self):
         self._stop = True
 
-    def _command(self, ftype, seq, want, tries=6, timeout=0.3):
+    def _command(self, ftype, seq, want, tries=6, timeout=None):
         frame = build_frame(ftype, seq)
+        timeout = timeout or self.cmd_timeout
         for _ in range(tries):
             self.port.write(frame)
             end = time.monotonic() + timeout
@@ -186,7 +190,7 @@ class Sender:
         self.seq = 1
         return r
 
-    def status(self, tries=6, timeout=0.3):
+    def status(self, tries=6, timeout=None):
         return self._command(T_STATUS, 0, lambda r: r.rtype == R_STATUS, tries, timeout)
 
     def send(self, chunks, progress=None):
@@ -265,7 +269,7 @@ class Sender:
                 self.stats["timeout"] += 1
                 last_rx = now
             # waiting for room in the FIFO with nothing in flight: ask for its level
-            if not in_flight and (pending or outstanding) and now - last_status > 0.02:
+            if not in_flight and (pending or outstanding) and now - last_status > self.status_every:
                 self.port.write(build_frame(T_STATUS, 0))
                 last_status = now
             if progress:
