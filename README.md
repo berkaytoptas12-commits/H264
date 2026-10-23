@@ -658,7 +658,7 @@ Simülasyon küçük bir ekran zamanlamasıyla yapılır (varsayılan 256x192, `
 | qcif_ip, ekran 160x128 (ortadan kırpma) | 8 kare birebir |
 | odd_100x60 (kırpmalı akış) | 6 kare birebir |
 | qcif_ip, 30 fps (`RATE=3000`) | her kare iki ekran karesi boyunca gösterildi |
-| hd720 (BT.709, ekran 256x192'ye ortadan kırpılmış) | ilk kare BT.709 dönüşümüyle birebir (720p'nin simülasyonda çözümü çok yavaş olduğu için kare tekrarlanarak gösterildi) |
+| hd720 (BT.709, ekran 256x192'ye ortadan kırpılmış) | 3 kare BT.709 dönüşümüyle birebir, 0 TMDS hatası (simülasyonda 720p çözümü ekrandan yavaş olduğu için kareler tekrarlandı; 0. ve 1. kare kırpılan bölgede aynıdır) |
 | qcif_ip, `RESTART=1`: akış bitince çözücü sıfırlanır, akış yeniden gönderilir (PC'den yeni video) | ilk turda 8 kare, kısa renk çubuğu geçişi, ikinci turda yine 8 kare birebir; çözücü hatası yok |
 | Kit yazılımı / PC (`kit/sim`) | `--bars`, VUI'den okunan 25 fps `DISP_CTRL`'e yazıldı |
 

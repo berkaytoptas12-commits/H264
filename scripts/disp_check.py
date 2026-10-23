@@ -119,9 +119,13 @@ def main():
         if cur >= 0 and np.array_equal(f, exp(cur)):
             runs[-1] += 1
             continue
-        if cur + 1 < len(ref) and np.array_equal(f, exp(cur + 1)):
-            cur += 1
-            runs.append(1)
+        # next frame; frames identical to the current one on the display can't be told apart
+        k = cur + 1
+        while k < len(ref) and not np.array_equal(f, exp(k)) and cur >= 0 and np.array_equal(exp(k), exp(cur)):
+            k += 1
+        if k < len(ref) and np.array_equal(f, exp(k)):
+            runs += [0] * (k - cur - 1) + [1]
+            cur = k
             continue
         k = min(cur + 1, len(ref) - 1)
         d = np.argwhere(f != exp(k))
