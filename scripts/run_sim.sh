@@ -8,7 +8,8 @@
 # Streams come from gen_streams.sh (<name>.264, <name>.ref.yuv, <name>.info).
 # Without names every stream in <stream_dir> is run.
 # Environment: STALL=0|1 (random AXI back-pressure, default 1), TIMEOUT_US,
-#              WORK (GHDL work directory, default ./sim/work)
+#              WORK (GHDL work directory, default ./sim/work),
+#              IEEE_ASSERTS=disable|enable (numeric_std warnings, default disable)
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -20,6 +21,9 @@ WORK=${WORK:-$ROOT/sim/work}
 OUT=${OUT:-$ROOT/sim/out}
 mkdir -p "$WORK" "$OUT"
 GHDL="ghdl"
+# numeric_std warnings come from pipeline registers that are evaluated
+# before they carry valid data; IEEE_ASSERTS=enable shows them
+IEEE_ASSERTS=${IEEE_ASSERTS:-disable}
 GFLAGS="--std=08 -frelaxed --workdir=$WORK"
 
 MODEL="$WORK/h264_model"
@@ -49,12 +53,12 @@ for n in "${names[@]}"; do
         res=$(python3 "$HERE/yuvcmp.py" "$OUT/$n.model.yuv" "$SDIR/$n.ref.yuv" "$w" "$h")
     elif [ "$MODE" = parse ]; then
         "$MODEL" "$SDIR/$n.264" "$OUT/$n.model.yuv" -p "$OUT/$n.model_trace.txt" 2>/dev/null
-        $GHDL -r $GFLAGS tb_parse --ieee-asserts=disable-at-0 -gG_IN="$SDIR/$n.264" -gG_TRACE="$OUT/$n.rtl_trace.txt" \
+        $GHDL -r $GFLAGS tb_parse --ieee-asserts=$IEEE_ASSERTS -gG_IN="$SDIR/$n.264" -gG_TRACE="$OUT/$n.rtl_trace.txt" \
             -gG_TIMEOUT_US="${TIMEOUT_US:-5000000}" > "$OUT/$n.log" 2>&1
         if cmp -s "$OUT/$n.model_trace.txt" "$OUT/$n.rtl_trace.txt"; then res="OK"; else res="TRACE MISMATCH"; fi
     else
         cw=$(( (w + 15) / 16 * 16 )); ch=$(( (h + 15) / 16 * 16 ))
-        $GHDL -r $GFLAGS tb_top --ieee-asserts=disable-at-0 -gG_IN="$SDIR/$n.264" -gG_OUT="$OUT/$n.rtl.yuv" -gG_MAXW=$cw -gG_MAXH=$ch \
+        $GHDL -r $GFLAGS tb_top --ieee-asserts=$IEEE_ASSERTS -gG_IN="$SDIR/$n.264" -gG_OUT="$OUT/$n.rtl.yuv" -gG_MAXW=$cw -gG_MAXH=$ch \
             -gG_STALL="${STALL:-1}" -gG_TIMEOUT_US="${TIMEOUT_US:-5000000}" > "$OUT/$n.log" 2>&1
         res=$(python3 "$HERE/yuvcmp.py" "$OUT/$n.rtl.yuv" "$SDIR/$n.ref.yuv" "$w" "$h")
     fi

@@ -3,6 +3,12 @@
 # the matching ffmpeg-decoded reference YUV files.
 #
 #   gen_streams.sh <out_dir> [quick]
+#   IMG=photo.png gen_streams.sh <out_dir>     also two clips from a photo
+#
+# With IMG set, a still photo is turned into camera-like footage (pan +
+# zoom, sub-pixel motion) and encoded with ordinary x264 Baseline settings
+# (preset medium, CRF 23): real_img_cif (352x288, 30 frames) and
+# real_img_vga (640x480, 12 frames).
 #
 # Each stream <name>.264 gets <name>.ref.yuv (cropped, decode order == output
 # order for these streams) and <name>.info (width height frames).
@@ -68,5 +74,19 @@ for m in poc0 poc1 ids reorder mmco ltidr mmco,reorder ltidr,reorder,poc0,ids; d
 done
 if [ "$MODE" != quick ]; then
     $ST rewrite "$OUT/cif_ref4.264" "$OUT/syn_c_mmco_reorder.264" mmco,reorder && syn syn_c_mmco_reorder 352 288 10
+fi
+# realistic clips from a photo (optional)
+real() {
+    local name=$1 size=$2 frames=$3 vf=$4
+    $FF -loop 1 -i "$IMG" -vf "$vf:s=$size:fps=25,format=yuv420p" -frames:v "$frames" \
+        -c:v libx264 -profile:v baseline -preset medium -crf 23 -f h264 "$OUT/$name.264"
+    $FF -i "$OUT/$name.264" -f rawvideo -pix_fmt yuv420p "$OUT/$name.ref.yuv"
+    echo "${size%x*} ${size#*x} $frames" > "$OUT/$name.info"
+}
+if [ -n "${IMG:-}" ]; then
+    real real_img_cif 352x288 30 \
+        "scale=1200:800:flags=bicubic,zoompan=z='1.15+0.012*on':x='iw/2-(iw/zoom/2)+60*sin(on/6)':y='ih/2-(ih/zoom/2)+30*cos(on/7)':d=1"
+    real real_img_vga 640x480 12 \
+        "scale=1024:1024:flags=bicubic,zoompan=z='1.25+0.01*on':x='iw/2-(iw/zoom/2)+40*sin(on/4)':y='ih/2-(ih/zoom/2)-3*on':d=1"
 fi
 ls "$OUT"/*.264 | wc -l

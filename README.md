@@ -151,8 +151,14 @@ Sonuçlar (GHDL 4.1, `STALL=1` rastgele AXI geri basıncı, okuma gecikmesi 12 �
 | syn_r_ltidr (uzun dönem IDR) | 176x144 | 10 | bit-exact | bit-exact | 200 |
 | syn_r_ltidr_reorder_poc0_ids (birleşik) | 176x144 | 10 | bit-exact | bit-exact | 200 |
 | syn_c_mmco_reorder | 352x288 | 10 | bit-exact | bit-exact | 195 |
+| real_img_cif (fotoğraf: kahve fincanı, kaydırma + yakınlaştırma) | 352x288 | 30 | – | bit-exact | 200 |
+| real_img_vga (fotoğraf: astronot) | 640x480 | 12 | – | bit-exact | 198 |
 
-32 akışın tamamı tb_top'ta, ayrıştırıcı izleri tb_parse'ta (hd1080 hariç, ayrıştırıcı testi çalıştırılmadı) bit-exact'tir. Ayrıştırıcı testbench'i ayrıca
+Son iki satır gerçek fotoğraflardan (scikit-image örnek görüntüleri) kamera hareketiyle üretilip
+x264'ün olağan Baseline ayarlarıyla (preset medium, CRF 23) kodlanmış kliplerdir; RTL çıktısının
+kaynak görüntüye göre PSNR'ı ~39 dB (CRF 23 kodlamanın kendisi), ffmpeg çıktısına göre ∞'dur.
+
+34 akışın tamamı tb_top'ta bit-exact'tir; ayrıştırıcı izleri tb_parse'ta (hd1080 ve real_img_* hariç, orada çalıştırılmadı) bit-exact'tir. Ayrıştırıcı testbench'i ayrıca
 iki benzetim iddiası (assertion) içerir: kod çözme aşamasında önceden hesaplanan tüketim miktarı ile
 kullanım aşamasının tükettiği miktar her sembolde aynı olmalı, total_zeros / run_before tablo
 numaraları bayat olmamalı; MC, iş parametreleri hazır olmadan okuma verisi gelirse durur.
@@ -166,7 +172,15 @@ scripts/gen_streams.sh streams          # x264 akışları + ffmpeg referans YUV
 scripts/run_sim.sh model streams        # C modeli ↔ ffmpeg
 scripts/run_sim.sh parse streams        # RTL ayrıştırıcı ↔ C modeli izi
 scripts/run_sim.sh top   streams qcif_ip qcif_ref3   # tam RTL ↔ ffmpeg
+
+# kendi fotoğrafınızdan kamera hareketli iki klip (real_img_cif, real_img_vga) üretip RTL'de çözmek:
+IMG=foto.png scripts/gen_streams.sh streams quick
+scripts/run_sim.sh top streams real_img_cif
 ```
+
+`run_sim.sh` çıktı YUV'unu `sim/out/<ad>.rtl.yuv` olarak yazar; ör.
+`ffmpeg -f rawvideo -pix_fmt yuv420p -s 352x288 -i sim/out/real_img_cif.rtl.yuv kare%02d.png`
+ile karelere bakılabilir.
 
 `scripts/gen_tables.py`, C modelindeki standart tablolarından `rtl/h264_tables_pkg.vhd`'yi üretir
 ve VLC ROM'larını olası tüm 16 bitlik desenlerle doğrular.
@@ -210,14 +224,17 @@ raporlarından alınmalıdır.
 | `h264_recon` | 14828 | 3092 | 8720 | 7 | 176 | 16.0 |
 | `h264_predbuf` | 6068 | 6 | 6272 | 0 | 0 | 7.0 |
 | `h264_coefbuf` | 0 | 0 | 0 | 8 | 0 | 0.0 |
-| `h264_deblock` | – | – | – | – | – | filtre kademesi ~10 (bkz. not) |
+| `h264_deblock` | ~41.8K LUT4 (bkz. not) | – | 8930 | (7) | 0 | 14 (LUT4) |
 
 Not: `h264_deblock` (büyük kayıt dizileri ve çoklayıcılar) yowasp-yosys'in 4 GB bellek sınırına
-sığmadı; yalnızca kenar filtresi kademeleri ayrı bir test varlığıyla ölçüldü (A ve B kademeleri ~10
-seviye, bS / parametre seçimiyle ~13). Kaba tahmin: ~15–20K LUT, ~9K FF, 7 LSRAM (satır tamponları).
+sığmadığı için yerel yosys 0.33 ile genel LUT4 eşlemesiyle sentezlendi (`synth_microchip` bu sürümde
+yok); bu akışta toplayıcılar da LUT'a eşlendiğinden LUT sayısı PolarFire eşlemesine göre yüksek, derinlik
+ise taşıma zincirleri LUT sayıldığı için kötümserdir. Satır tamponları (512x160 ve 512x96 bit) RAM olarak
+çıkarıldı (~7 LSRAM). Kenar filtresi kademeleri ayrıca PolarFire eşlemesiyle ölçüldü (~10 seviye).
 Yosys sabitle çarpmaları da MACC bloklarına eşler; Synplify bunların çoğunu mantıkla gerçekleştirir.
-Toplam (deblock hariç): ~50K LUT + 8K ARI1, ~28K FF, 24 LSRAM. MPFS250T'de 254K LE, 812 LSRAM ve
-784 MACC vardır; çözücü cihazın yaklaşık üçte birini kullanır.
+Toplam: deblock hariç ~50K LUT + 8K ARI1, ~28K FF, 24 LSRAM; deblock ile kabaca ~90K LUT, ~37K FF,
+~31 LSRAM. MPFS250T'de 254K LE, 812 LSRAM ve 784 MACC vardır; çözücü cihazın kabaca %35–40'ını
+kullanır.
 
 ## 7. MPFS250 Video Kit'e entegrasyon (Libero SoC)
 
