@@ -71,6 +71,9 @@ MB'ler üzerinde paralel çalışır.
 | `rtl/h264_deblock.vhd` | 20x20 luma / 12x12 kroma çalışma dizisi, satır-sütun filtre boru hattı (kenar başına bir kademe), satır tamponları, bayt maskeli AXI yazma (adres kanalı veri kanalının önünde, beat'ler arka arkaya) |
 | `rtl/h264_ram.vhd` | Basit çift portlu RAM (LSRAM/uSRAM çıkarımı, 2 çevrim okuma gecikmesi), 4 şeritli katsayı tamponu, tahmin tamponu |
 | `rtl/h264_dec_top.vhd` | Üst seviye: tüm aşamalar + tek AXI4 master |
+| `rtl/h264_uart.vhd` | 8N1 UART alıcı / verici (fabric) |
+| `rtl/h264_link.vhd` | PC bağlantısı protokol motoru: CRC16'lı çerçeveler, ACK/NAK, kredi, 32 KB FIFO, START/END/STATUS (bölüm 8) |
+| `rtl/h264_dec_uart_top.vhd` | Çözücü + UART + protokol motoru; kitte SmartDesign'a eklenecek blok |
 
 Deblocking çıkışı neden kaydırılmış pencere? Bir MB filtrelendiğinde, sağındaki ve altındaki MB'ler
 henüz sınır satırlarını/sütunlarını değiştirecektir. Bu nedenle her MB adımında, kesinleşmiş olan
@@ -269,6 +272,8 @@ periyodu 13.333 ns'ye (75 MHz) çekin, 1080p30 yine karşılanır. Gerekli saat 
    `G_FB_BASE`, DDR penceresinde 72 MiB'lık boş, 4 MiB hizalı bir alanı göstermelidir.
 4. Bit akışı kaynağı: `s_axis_*` (8 bit) arayüzüne herhangi bir fabric kaynağı bağlanabilir (DDR'dan
    okuyan basit bir DMA, Ethernet/UDP alıcısı, SD kart okuyucu...). Akışın son baytında `tlast=1`.
+   Videoyu PC'den seri bağlantıyla göndermek için `h264_dec_top` yerine `h264_dec_uart_top` kullanın
+   (bölüm 8; Libero betiğinde `SCRIPT_ARGS:"./h264_dec_prj h264_dec_uart_top"`).
 5. Ekran: `o_frame_valid/index` ile gelen tamponu, kitin HDMI yolunu besleyen bir çerçeve okuyucu
    (YUV420 → YUV422/RGB dönüşümü ile) okur; okuma bitince `i_release` ile geri verir. Çıkış çerçeve
    hızını ayarlamak (ör. 30 fps) tüketicinin görevidir; tüketici tamponu tutarken çözücü o tamponu
@@ -282,7 +287,91 @@ PolarFire hücrelerine eşler ve `scripts/pf_depth.py` ile en uzun kayıttan kay
 olarak verir (taşıma zinciri bit başına 0.1 seviye sayılır). Sonuçlar bölüm 6.1'dedir; kesin
 değerler Libero'dan alınmalıdır.
 
-## 8. Dizin yapısı
+## 8. PC'den kite video gönderme (seri bağlantı)
+
+```
+ PC                                   MPFS250 Video Kit (yalnızca fabric)
+ h264_gui.py / h264_send.py           ┌────────────────────────────────────────────────────┐
+ ffmpeg ile Baseline'a dönüştürme ──► │ uart_rx ─► h264_uart_rx ─► h264_link ─► h264_dec_top│─► DDR4 / ekran
+ (gerekirse), çerçeveleme, CRC  USB   │ uart_tx ◄─ h264_uart_tx ◄─ (32 KB FIFO)  AXI-Stream │
+                         USB-UART ◄── └────────────────────────────────────────────────────┘
+```
+
+`h264_dec_uart_top` çözücünün AXI-Stream girişinin önüne bir UART ve bir protokol motoru koyar;
+MSS / RISC-V kullanılmaz. PC tarafında Python programları videoyu gönderir.
+
+### 8.1 Hangi seri port?
+
+Kitteki CP2108 dört kanallı USB-UART köprüsünün MMUART_0/1 kanalları MSS'e (Linux konsolu)
+bağlıdır; bunlar MSS olmadan kullanılamaz. Seçenekler:
+
+* CP2108'in fabric I/O'ya giden bir kanalı varsa (kit şeması / kullanım kılavuzu DS00004698'den
+  kontrol edin) onu kullanın; CP2108 en fazla 2 Mbaud'dur.
+* Yoksa fabric'e giden bir başlığa 3.3 V'luk harici bir USB-UART dönüştürücü bağlayın
+  (FT232H / FT2232H: 4 Mbaud 100 MHz'te tam bölünür; dönüştürücünün TXD'si → `uart_rx`,
+  RXD'si ← `uart_tx`, ortak GND).
+
+Pinler `libero/uart_pins.pdc` şablonunda yer tutucu olarak duruyor; kartınıza göre doldurun.
+Generic'ler: `G_CLK_HZ` (100 MHz), `G_BAUD` (2 000 000), `G_FIFO_AW` (15 → 32 KB). `G_CLK_HZ / G_BAUD`
+tam sayıya %2'den yakın olmalıdır. LED çıkışları: `led_rx` (çerçeve geliyor), `led_err` (CRC hatası
+veya çözücü hatası), `led_done` (akış bitti).
+
+| Baud | Yararlı veri hızı | Not |
+|---|---|---|
+| 2 000 000 | ~1.6 Mbit/s | CP2108 üst sınırı, 100 MHz / 50 |
+| 4 000 000 | ~3.2 Mbit/s | FT232H/FT2232H, 100 MHz / 25 |
+
+Bit hızı bağlantıdan yüksek bir akış da doğru çözülür, yalnızca gerçek zamandan yavaş oynar. Bu
+yüzden dönüştürme yaparken programlar varsayılan bit hızını bağlantıya sığacak şekilde seçer
+(2 Mbaud'da ~1.2 Mbit/s; 720p için yeterli kalite).
+
+### 8.2 Protokol (özet; ayrıntılar `rtl/h264_link.vhd` başlığında)
+
+* PC → FPGA çerçevesi: `55 AA | tür | sıra | uzunluk (≤ 1024) | veri | CRC16`. Türler: DATA, END (akış
+  sonu, son bayta `tlast`), START (çözücüyü ve bağlantıyı sıfırla), STATUS (durum sor).
+* FPGA → PC yanıtı (16 bayt): ACK / NAK / STATUS + FIFO'daki boş alan (kredi), çözülen resim sayısı,
+  hata / bitti bayrakları, çözünürlük; CRC16 ile korunur.
+* Akış kontrolü: PC en fazla 16 çerçeveyi yolda tutar ve FIFO'nun bildirdiği boş alandan fazlasını
+  göndermez. CRC hatalı ya da sırası bozuk çerçevede FPGA NAK gönderir, PC beklenen çerçeveden
+  itibaren yeniden gönderir (go-back-N); yanıt kaybolursa zaman aşımıyla yeniden gönderir. Tekrar
+  gelen çerçeve yeniden onaylanır ama FIFO'ya ikinci kez yazılmaz.
+* DATA verisi FIFO'ya geçici olarak yazılır, CRC doğruysa onaylanır; aksi hâlde geri alınır.
+
+### 8.3 PC programları (`host/`)
+
+Gerekenler: Python 3.8+, `pip install pyserial`, dönüştürme için PATH'te libx264'lü ffmpeg. GUI
+Tkinter kullanır (Windows/macOS'ta Python ile gelir; Linux'ta `python3-tk`).
+
+```sh
+python host/h264_gui.py                                   # arayüz: port, video, boyut, bit hızı, ilerleme, durum
+python host/h264_send.py --list                           # seri portlar
+python host/h264_send.py -p COM5 video.264                # Baseline .264 dosyasını olduğu gibi gönder
+python host/h264_send.py -p COM5 film.mp4 --size 1280x720 --bitrate 1.2M   # ffmpeg ile dönüştürerek
+python host/h264_send.py -p COM5 --status                 # çözücü durumu
+```
+
+Baseline olmayan dosyalar (`.mp4`, `.mkv`, High profil `.264`...) gönderilirken ffmpeg ile
+Constrained Baseline Annex-B akışına dönüştürülür (geçici dosya olmadan, boru hattıyla). Program
+her gönderimden önce START ile çözücüyü sıfırlar, sonunda END gönderir ve çözücü "akış bitti"
+diyene kadar resim sayısını gösterir.
+
+Kit olmadan denemek için `host/fpga_emu.py` FPGA tarafının yazılım modelidir (RTL ile aynı
+protokol davranışı, sınırlı FIFO, yavaş çözücü ve hata enjeksiyonu); Linux/macOS'ta sözde
+terminal üzerinde çalışır: `python3 host/fpga_emu.py --pty` → yazdığı `/dev/pts/N` ile
+`h264_send.py -p /dev/pts/N ...`.
+
+### 8.4 Doğrulama
+
+| Test | Kapsam | Sonuç |
+|---|---|---|
+| `scripts/run_sim.sh link streams <ad>` (`tb/tb_link.vhd`) | Python'un ürettiği çerçeveler UART üzerinden RTL'e; CRC hatalı çerçeve (NAK + yeniden gönderme), sıra dışı çerçeve, tekrar gönderilen çerçeve, küçük FIFO ile kredi bekleme, rastgele geri basınç, START; RTL yanıtları Python ayrıştırıcıyla denetlenir | qcif_ip, qcif_intra ve 300 KB rastgele veri (571 çerçeve, sıra numarası taşması): çıktı birebir, `tlast` son baytta |
+| `scripts/run_sim.sh top-uart streams <ad>` | Akış UART + protokol üzerinden tam çözücüye (bir çerçeve bilerek bozuk) | qcif_ip, qcif_intra, real_coffee_cif (fotoğraf klibi, 30 kare): YUV ffmpeg ile bit-exact |
+| `python3 host/test_link.py <akış.264>` | Gerçek pyserial ile PC programı ↔ FPGA modeli (sözde terminal): temiz hat, bayt hataları + kayıp yanıtlar, küçük FIFO + yavaş çözücü | qcif_ip, real_coffee_cif: tümü birebir |
+| GUI (Xvfb altında, FPGA modeline karşı) | .264 dosyası ve ffmpeg ile dönüştürülen High profil MP4 | Teslim edilen akış birebir / Constrained Baseline, C modeli ve ffmpeg ile aynı çözülüyor |
+
+Kaynak (yosys tahmini): `h264_link` ~500 LUT, 355 FF, 16 LSRAM (32 KB FIFO); UART'lar ~70 LUT.
+
+## 9. Dizin yapısı
 
 ```
 model/    C referans modeli (h264_model.c)
@@ -290,14 +379,19 @@ rtl/      VHDL-2008 RTL
 tb/       GHDL testbench'leri (tb_parse, tb_top, tb_util_pkg)
 scripts/  gen_streams.sh, stream_tools.py, gen_tables.py, run_sim.sh, yuvcmp.py,
           synth_estimate.sh, pf_depth.py
-libero/   create_project.tcl (Libero SoC projesi + sentez), h264_dec.sdc
+host/     PC programları: h264_send.py (komut satırı), h264_gui.py (arayüz), h264link.py (protokol),
+          fpga_emu.py (FPGA tarafının yazılım modeli), test_link.py, make_vectors.py
+libero/   create_project.tcl (Libero SoC projesi + sentez), h264_dec.sdc, uart_pins.pdc (şablon)
 ```
 
-## 9. Bilinen sınırlar / yol haritası
+## 10. Bilinen sınırlar / yol haritası
 
 * Main/High profil (CABAC, B slice, 8x8 dönüşüm) desteklenmiyor.
 * Çıkış sırası çözme sırasıdır; B slice olmayan akışlarda bu, gösterim sırasıyla aynıdır.
 * Hata gizleme (error concealment) yok; eksik slice'lı bir resim tamamlanmaz.
 * Zamanlama yalnızca açık kaynak araçlarla tahmin edildi (bölüm 6.1); Libero'da doğrulanmalıdır.
+* PC bağlantısı UART hızıyla sınırlıdır (2–4 Mbaud). Kitteki iki Gigabit Ethernet (VSC8662, SGMII)
+  fabric'e bağlıysa `h264_link` bayt arayüzünün önüne bir UDP alıcısı konularak 100 Mbit/s üstüne
+  çıkılabilir; protokol motoru taşıyıcıdan bağımsızdır.
 * Olası iyileştirmeler: deblock'ta MB yüklemesini önceki MB'nin çıkışıyla örtüştürmek, CAVLC'de
   level + run_before'u tek adımda çözmek, tahmin tamponunu LSRAM'e taşımak.

@@ -1,0 +1,17 @@
+# ============================================================================
+# I/O constraints for h264_dec_uart_top: serial link to the PC and LEDs.
+#
+# THE PIN NAMES BELOW ARE PLACEHOLDERS.  Take them from the MPFS250 Video Kit
+# schematic / user guide (DS00004698):
+#   * a CP2108 USB-UART channel that is wired to FPGA fabric I/O (the
+#     MMUART_0/1 channels go to the MSS and cannot be used without the MSS), or
+#   * an external 3.3 V USB-UART adapter (FT232H / FT2232H / CP2102N ...) on a
+#     header whose pins reach the fabric: adapter TXD -> uart_rx,
+#     adapter RXD <- uart_tx, common GND.
+# Set -io_std to the voltage of the bank (LVCMOS33 / LVCMOS18 ...).
+# ============================================================================
+set_io -port_name {uart_rx}  -pin_name {PIN_UART_RX} -fixed true -DIRECTION INPUT  -io_std LVCMOS33
+set_io -port_name {uart_tx}  -pin_name {PIN_UART_TX} -fixed true -DIRECTION OUTPUT -io_std LVCMOS33
+set_io -port_name {led_rx}   -pin_name {PIN_LED0}    -fixed true -DIRECTION OUTPUT -io_std LVCMOS33
+set_io -port_name {led_err}  -pin_name {PIN_LED1}    -fixed true -DIRECTION OUTPUT -io_std LVCMOS33
+set_io -port_name {led_done} -pin_name {PIN_LED2}    -fixed true -DIRECTION OUTPUT -io_std LVCMOS33

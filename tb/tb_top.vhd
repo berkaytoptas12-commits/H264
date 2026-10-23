@@ -25,7 +25,12 @@ entity tb_top is
         G_STALL      : natural := 1;        -- random AXI back-pressure
         G_TIMEOUT_US : natural := 2000000;
         G_RTRACE     : string  := "";       -- unfiltered macroblock trace (debug)
-        G_PERF       : natural := 1         -- report busy cycles per stage
+        G_PERF       : natural := 1;        -- report busy cycles per stage
+        -- G_UART = 1: the stream goes over the PC link (UART -> h264_link) as
+        -- frames from host/make_vectors.py (G_FRAMES), G_UDIV cycles per bit
+        G_UART       : natural := 0;
+        G_FRAMES     : string  := "";
+        G_UDIV       : positive := 8
     );
 end entity;
 
@@ -112,6 +117,19 @@ architecture sim of tb_top is
     signal s_tvalid : std_logic := '0';
     signal s_tlast  : std_logic := '0';
     signal s_tready : std_logic;
+    -- direct feed / PC link
+    signal f_tdata  : std_logic_vector(7 downto 0) := (others => '0');
+    signal f_tvalid : std_logic := '0';
+    signal f_tlast  : std_logic := '0';
+    signal l_tdata  : std_logic_vector(7 downto 0);
+    signal l_tvalid, l_tlast, l_tready : std_logic;
+    signal h2f      : std_logic := '1';
+    signal f2h      : std_logic;
+    signal u_rxd, u_txd : std_logic_vector(7 downto 0);
+    signal u_rxv, u_txv, u_txr : std_logic;
+    signal link_rst, dut_rst : std_logic;
+    signal r_evt    : natural := 0;
+    signal r_type, r_seq, r_free : natural;
 
     signal awaddr, araddr : std_logic_vector(31 downto 0);
     signal awlen, arlen : std_logic_vector(7 downto 0);
@@ -131,9 +149,30 @@ architecture sim of tb_top is
 begin
     clk <= not clk after 5 ns when not done;
 
+    -- PC link in front of the decoder (G_UART = 1)
+    u_urx : entity work.h264_uart_rx
+        generic map (G_DIV => G_UDIV)
+        port map (clk => clk, rst => rst, i_rx => h2f, o_data => u_rxd, o_valid => u_rxv, o_ferr => open);
+    u_utx : entity work.h264_uart_tx
+        generic map (G_DIV => G_UDIV)
+        port map (clk => clk, rst => rst, i_data => u_txd, i_valid => u_txv, o_ready => u_txr, o_tx => f2h);
+    u_link : entity work.h264_link
+        generic map (G_FIFO_AW => 15)
+        port map (clk => clk, rst => rst, i_rx_data => u_rxd, i_rx_valid => u_rxv,
+                  o_tx_data => u_txd, o_tx_valid => u_txv, i_tx_ready => u_txr,
+                  m_axis_tdata => l_tdata, m_axis_tvalid => l_tvalid, m_axis_tlast => l_tlast,
+                  m_axis_tready => l_tready, o_dec_rst => link_rst,
+                  i_pic_count => pic_count, i_error => dec_err, i_stream_done => stream_done,
+                  i_width => width, i_height => height, o_frame_ok => open, o_frame_bad => open);
+    s_tdata <= l_tdata when G_UART /= 0 else f_tdata;
+    s_tvalid <= l_tvalid when G_UART /= 0 else f_tvalid;
+    s_tlast <= l_tlast when G_UART /= 0 else f_tlast;
+    l_tready <= s_tready when G_UART /= 0 else '0';
+    dut_rst <= rst or link_rst when G_UART /= 0 else rst;
+
     dut : entity work.h264_dec_top
         port map (
-            clk => clk, rst => rst,
+            clk => clk, rst => dut_rst,
             s_axis_tdata => s_tdata, s_axis_tvalid => s_tvalid, s_axis_tlast => s_tlast, s_axis_tready => s_tready,
             m_axi_awid => open, m_axi_awaddr => awaddr, m_axi_awlen => awlen, m_axi_awsize => open,
             m_axi_awburst => open, m_axi_awlock => open, m_axi_awcache => open, m_axi_awprot => open,
@@ -153,31 +192,153 @@ begin
             o_crop_top => crop_t, o_crop_bottom => crop_b,
             o_error => dec_err, o_stream_done => stream_done, o_pic_count => pic_count);
 
-    -- stream feeder
+    -- stream feeder: directly (AXI-Stream) or over the PC link
     feed : process
         file f : char_file_t;
         variable c : character;
         variable st : file_open_status;
+        file ff : text;
+        variable l : line;
+        type bytes_t is array (0 to 4194303) of natural range 0 to 255;
+        variable fb : bytes_t;
+        type idx_t is array (0 to 8191) of natural;
+        variable fo, fl : idx_t;
+        variable nf, pos, v, free, plen, seq, k : natural := 0;
+        variable ch : character;
+        constant TBIT : time := G_UDIV * 10 ns;
+
+        function hexval(h : character) return natural is
+        begin
+            if h >= '0' and h <= '9' then
+                return character'pos(h) - character'pos('0');
+            end if;
+            return character'pos(h) - character'pos('a') + 10;
+        end function;
+
+        procedure send_frame(n : natural; corrupt : boolean) is
+            variable u : unsigned(7 downto 0);
+        begin
+            for i in 0 to fl(n) - 1 loop
+                u := to_unsigned(fb(fo(n) + i), 8);
+                if corrupt and i = 8 then
+                    u(3) := not u(3);
+                end if;
+                h2f <= '0';
+                wait for TBIT;
+                for b in 0 to 7 loop
+                    h2f <= u(b);
+                    wait for TBIT;
+                end loop;
+                h2f <= '1';
+                wait for TBIT;
+            end loop;
+        end procedure;
+
+        procedure response is
+        begin
+            wait on r_evt for 20 ms;
+            assert r_evt'event report "PC link: no response" severity failure;
+            free := r_free;
+        end procedure;
     begin
         mem.init(G_NFB, G_MAXW, G_MAXH);
-        file_open(st, f, G_IN, read_mode);
-        assert st = open_ok report "cannot open " & G_IN severity failure;
         wait until rising_edge(clk);
         wait until rising_edge(clk);
         rst <= '0';
         wait until rising_edge(clk);
-        while not endfile(f) loop
-            read(f, c);
-            s_tdata <= std_logic_vector(to_unsigned(character'pos(c), 8));
-            s_tvalid <= '1';
-            if endfile(f) then
-                s_tlast <= '1';
-            end if;
-            wait until rising_edge(clk) and s_tready = '1';
-        end loop;
-        s_tvalid <= '0';
-        s_tlast <= '0';
+        if G_UART = 0 then
+            file_open(st, f, G_IN, read_mode);
+            assert st = open_ok report "cannot open " & G_IN severity failure;
+            while not endfile(f) loop
+                read(f, c);
+                f_tdata <= std_logic_vector(to_unsigned(character'pos(c), 8));
+                f_tvalid <= '1';
+                if endfile(f) then
+                    f_tlast <= '1';
+                end if;
+                wait until rising_edge(clk) and s_tready = '1';
+            end loop;
+            f_tvalid <= '0';
+            f_tlast <= '0';
+        else
+            -- frames: S start, Q status, D data ..., E end (make_vectors.py)
+            file_open(st, ff, G_FRAMES, read_mode);
+            assert st = open_ok report "cannot open " & G_FRAMES severity failure;
+            while not endfile(ff) loop
+                readline(ff, l);
+                exit when l'length < 3;
+                read(l, ch);
+                fo(nf) := pos;
+                while l'length > 1 loop
+                    read(l, ch);
+                    v := hexval(ch) * 16;
+                    read(l, ch);
+                    fb(pos) := v + hexval(ch);
+                    pos := pos + 1;
+                end loop;
+                fl(nf) := pos - fo(nf);
+                nf := nf + 1;
+            end loop;
+            wait for 1 us;
+            send_frame(0, false);                  -- START
+            response;
+            assert r_type = 16#81# report "PC link: START not acknowledged" severity failure;
+            for n in 2 to nf - 1 loop              -- data frames, then END
+                plen := fb(fo(n) + 4) + 256 * fb(fo(n) + 5);
+                while plen > free loop
+                    wait for 50 us;
+                    send_frame(1, false);          -- STATUS
+                    response;
+                end loop;
+                send_frame(n, n = 4);              -- frame 4 once with a bit error
+                response;
+                while r_type = 16#82# loop
+                    send_frame(n, false);
+                    response;
+                end loop;
+                assert r_type = 16#81# and r_seq = (n - 1) mod 256
+                    report "PC link: frame " & integer'image(n) & " not acknowledged" severity failure;
+            end loop;
+            report "PC link: " & integer'image(nf - 3) & " data frames sent";
+        end if;
         wait;
+    end process;
+
+    -- PC link: responses from the FPGA (type, seq, free)
+    link_rx : process
+        variable b, cnt : natural := 0;
+        variable buf : integer_vector(0 to 15);
+        constant TBIT : time := G_UDIV * 10 ns;
+    begin
+        if G_UART = 0 then
+            wait;
+        end if;
+        loop
+            wait until f2h = '0';
+            wait for TBIT / 2;
+            b := 0;
+            for i in 0 to 7 loop
+                wait for TBIT;
+                if f2h = '1' then
+                    b := b + 2 ** i;
+                end if;
+            end loop;
+            wait for TBIT;
+            if cnt = 0 and b /= 16#5A# then
+                next;
+            end if;
+            buf(cnt) := b;
+            cnt := cnt + 1;
+            if cnt = 2 and b /= 16#A5# then
+                cnt := 0;
+            elsif cnt = 16 then
+                cnt := 0;
+                r_type <= buf(2);
+                r_seq <= buf(3);
+                r_free <= buf(4) + 256 * buf(5);
+                r_evt <= r_evt + 1;
+            end if;
+        end loop;
     end process;
 
     process (clk)

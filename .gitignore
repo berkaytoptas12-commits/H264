@@ -6,3 +6,4 @@ streams/
 *.ghw
 *.o
 *.cf
+__pycache__/
