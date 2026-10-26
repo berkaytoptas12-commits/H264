@@ -2,7 +2,7 @@
 """Check the frames captured by tb/tb_disp.vhd (decoded TMDS, RGB24) against
 the reference decoder output.
 
-    disp_check.py captured.rgb ref.yuv src_w src_h disp_w disp_h [--runs N]
+    disp_check.py captured.rgb ref.yuv src_w src_h disp_w disp_h [--runs N | --min-runs N]
 
 Every captured frame must be either the 75 % colour bars (only before the
 first picture) or the expected display image of a decoded frame; the frame
@@ -86,6 +86,7 @@ def main():
     ap.add_argument("W", type=int)
     ap.add_argument("H", type=int)
     ap.add_argument("--runs", type=int, help="every frame but the first and last shown this many times")
+    ap.add_argument("--min-runs", type=int, help="... at least this many times (decoder slower than the display)")
     ap.add_argument("--restart", action="store_true",
                     help="the stream was sent twice with a decoder reset between: two passes expected")
     a = ap.parse_args()
@@ -142,6 +143,9 @@ def main():
         ok = False
     if ok and a.runs and any(r != a.runs for r in runs[1:-1]):
         print("frame repeat counts %s, expected %d" % (runs, a.runs))
+        ok = False
+    if ok and a.min_runs and any(r < a.min_runs for r in runs[1:-1]):
+        print("frame repeat counts %s, expected at least %d" % (runs, a.min_runs))
         ok = False
     print("%s: %d captured frames, %d colour bar frames, decoded frames 0..%d shown%s, repeats %s"
           % ("OK" if ok else "FAIL", len(caps), nbars, cur, " (2 passes)" if passes == 2 else "",

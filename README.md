@@ -616,7 +616,7 @@ LANE1 = mavi (HSYNC/VSYNC), LANE2 = yeşil, LANE3 = kırmızı; piksel tarafı L
 | 0x30 | DISP_STAT | [15:0] kare geçişi sayısı, [31:16] verisi zamanında gelmediği için siyah gösterilen satır sayısı |
 
 **Kaynak (yosys tahmini):**
-* Okuyucu (`h264_disp_rd`, 100 MHz): ~1600 LUT, ~1650 FF, en uzun yol 11.7 seviye; çözücü
+* Okuyucu (`h264_disp_rd`, 100 MHz): ~1600 LUT, ~1650 FF, en uzun yol 13.4 seviye; çözücü
   modüllerinin altında.
 * Piksel tarafı (`h264_disp_px`, 37.125 MHz, üç TMDS kodlayıcı dahil): ~2550 LUT, ~1250 FF,
   56 MACC. En uzun yol 21.5 seviye; bu, dört sembol boyunca zincirlenen TMDS DC dengesidir ve

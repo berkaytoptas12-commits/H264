@@ -16,7 +16,9 @@
 # Streams come from gen_streams.sh (<name>.264, <name>.ref.yuv, <name>.info).
 # Without names every stream in <stream_dir> is run.
 # Environment: STALL=0|1 (random AXI back-pressure, default 1), TIMEOUT_US,
-#              DISP=WxH (display size for disp, default 256x192), RATE (fps*100, 6000),
+#              DISP=WxH (display size for disp, default 256x192), RATE (fps*100, 6000;
+#              each frame shown 6000/RATE times, more often if the decoder is slower than
+#              the display),
 #              RESTART=1 (disp: decoder reset after the stream, stream sent again),
 #              WORK (GHDL work directory, default ./sim/work),
 #              IEEE_ASSERTS=disable|enable (numeric_std warnings, default disable)
@@ -73,10 +75,15 @@ for n in "${names[@]}"; do
     elif [ "$MODE" = disp ]; then
         cw=$(( (w + 15) / 16 * 16 )); ch=$(( (h + 15) / 16 * 16 ))
         dw=${DISP%x*}; dh=${DISP#*x}
+        # each frame is shown 6000/RATE times, exactly if the decoder keeps up with the
+        # display (frame time in 10 ns decoder cycles: 4 pixels per 25 ns, blanking 64 x 8;
+        # ~300 cycles per macroblock with margin), else at least that often
+        mbs=$(( cw * ch / 256 )); fcyc=$(( (dw + 64) / 4 * (dh + 8) * 5 / 2 ))
+        rflag=--runs; [ $(( mbs * 300 )) -lt $fcyc ] || rflag=--min-runs
         runs=()
         if [ "${RESTART:-0}" = 1 ]; then runs=(--restart)
-        elif [ "${RATE:-6000}" = 6000 ]; then runs=(--runs 1)
-        elif [ "${RATE:-6000}" = 3000 ]; then runs=(--runs 2); fi
+        elif [ "${RATE:-6000}" = 6000 ]; then runs=($rflag 1)
+        elif [ "${RATE:-6000}" = 3000 ]; then runs=($rflag 2); fi
         # after the last frame is handed over: queue (4) + current frame, each shown 6000/RATE times
         extra=$(( (6000 + ${RATE:-6000} - 1) / ${RATE:-6000} * 5 + 2 ))
         $GHDL -r $GFLAGS tb_disp --ieee-asserts=$IEEE_ASSERTS -gG_IN="$SDIR/$n.264" -gG_OUT="$OUT/$n.disp.rgb" \
